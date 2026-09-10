@@ -1,0 +1,44 @@
+{
+  "match_result": {
+    "winner": "defender",
+    "scores": {
+      "challenger": 30.0,
+      "defender": 2788.0
+    },
+    "score_detail": {
+      "challenger": {
+        "task": 0.0,
+        "kill": 0,
+        "survive": 30.0
+      },
+      "defender": {
+        "task": 2750.0,
+        "kill": 8,
+        "survive": 30.0
+      }
+    },
+    "base_destroyed_round": {
+      "challenger": null,
+      "defender": null
+    },
+    "kills": {
+      "challenger": 0,
+      "defender": 8
+    }
+  },
+  "judge": {
+    "conclusion": "rounds_exhausted",
+    "rounds": 260,
+    "abnormal": {
+      "challenger": 0,
+      "defender": 0
+    },
+    "suspended": {
+      "challenger": false,
+      "defender": false
+    },
+    "wall_time": 0.6369121074676514
+  },
+  "record": "matches/demo_2day.jsonl",
+  "seed": 42
+}

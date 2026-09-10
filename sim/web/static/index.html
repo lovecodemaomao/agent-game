@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>未来战争 - 对战回放</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font: 13px/1.5 "SF Mono", Menlo, Consolas, monospace; background: #10141c; color: #cdd6e0; padding: 12px; }
+  h1 { font-size: 16px; margin-bottom: 8px; color: #7ec8ff; }
+  #toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  button, select { background: #1c2635; color: #cdd6e0; border: 1px solid #33455e; border-radius: 4px; padding: 4px 10px; cursor: pointer; }
+  button:hover { background: #26354a; }
+  #roundInfo { min-width: 200px; color: #ffd479; }
+  #main { display: flex; gap: 12px; flex-wrap: wrap; }
+  #canvasWrap { position: relative; }
+  canvas { background: #0a0e14; border: 1px solid #33455e; image-rendering: pixelated; }
+  #side { flex: 1; min-width: 420px; display: flex; flex-direction: column; gap: 8px; }
+  .panel { background: #141a26; border: 1px solid #263349; border-radius: 6px; padding: 8px; }
+  .panel h2 { font-size: 12px; color: #8fa8c7; margin-bottom: 6px; }
+  table.res { width: 100%; border-collapse: collapse; }
+  table.res td, table.res th { padding: 2px 6px; text-align: left; border-bottom: 1px solid #1d2836; }
+  .ch { color: #66d9a5; } .de { color: #ff8f8f; }
+  #actions { max-height: 220px; overflow-y: auto; font-size: 12px; }
+  #actions div { padding: 1px 0; border-bottom: 1px dashed #1d2836; }
+  #log { max-height: 200px; overflow-y: auto; font-size: 12px; }
+  #log div { padding: 1px 0; }
+  .ev-attack { color: #ffb26b; } .ev-death { color: #ff6b6b; }
+  .ev-build { color: #7ec8ff; } .ev-collect { color: #9ae6b4; }
+  .ev-sell, .ev-buy { color: #ffd479; } .ev-treasure_opened { color: #d0a2ff; }
+  .ev-damage { color: #888; } .ok { color: #66d9a5; } .bad { color: #ff6b6b; }
+</style>
+</head>
+<body>
+<h1>《未来战争》本地对战回放</h1>
+<div id="toolbar">
+  <select id="matchSel"><option>加载中...</option></select>
+  <button id="btnLoad">加载</button>
+  <button id="btnPrev">◀</button>
+  <button id="btnPlay">▶ 播放</button>
+  <button id="btnNext">▶|</button>
+  <select id="speed"><option value="500">0.5s</option><option value="200" selected>0.2s</option><option value="50">快</option></select>
+  <select id="viewSel"><option value="challenger">挑战者视角</option><option value="defender">防守者视角</option></select>
+  <span id="roundInfo">-</span>
+</div>
+<div id="main">
+  <div id="canvasWrap"><canvas id="cv" width="656" height="512"></canvas></div>
+  <div id="side">
+    <div class="panel"><h2>资源面板</h2><table class="res" id="resTable"></table></div>
+    <div class="panel"><h2>本回合双方动作</h2><div id="actions">-</div></div>
+    <div class="panel"><h2>积分曲线</h2><canvas id="cvScore" width="420" height="120"></canvas></div>
+    <div class="panel"><h2>事件日志 <select id="logFilter"><option value="">全部</option><option value="attack">攻击</option><option value="death">死亡</option><option value="build">建造</option><option value="treasure_opened">宝藏</option></select></h2><div id="log">-</div></div>
+  </div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

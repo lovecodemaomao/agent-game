@@ -1,0 +1,14 @@
+{
+  "name": "economy",
+  "description": "经济压制：轻防御重采集，中期开始骚扰",
+  "harass_budget": 0.3,
+  "wall_density": 0.8,
+  "weapon_build_order": ["railgun", "gatling", "rocket"],
+  "task_tempo": 0.5,
+  "mine_preference": {"stone": 1, "iron": 3, "copper": 3},
+  "upgrade_priority": ["weapon", "base", "wall"],
+  "sell_timing": "immediate",
+  "sell_backpack_threshold": 16,
+  "wall_target_per_side": 4,
+  "base_hp_warn_ratio": 0.6
+}

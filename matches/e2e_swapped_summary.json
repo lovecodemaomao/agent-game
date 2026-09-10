@@ -1,0 +1,44 @@
+{
+  "match_result": {
+    "winner": "challenger",
+    "scores": {
+      "challenger": 1682.0,
+      "defender": 179.0
+    },
+    "score_detail": {
+      "challenger": {
+        "task": 1500.0,
+        "kill": 32,
+        "survive": 150.0
+      },
+      "defender": {
+        "task": 0.0,
+        "kill": 29,
+        "survive": 150.0
+      }
+    },
+    "base_destroyed_round": {
+      "challenger": 607,
+      "defender": 600
+    },
+    "kills": {
+      "challenger": 32,
+      "defender": 29
+    }
+  },
+  "judge": {
+    "conclusion": "both_destroyed",
+    "rounds": 608,
+    "abnormal": {
+      "challenger": 0,
+      "defender": 0
+    },
+    "suspended": {
+      "challenger": false,
+      "defender": false
+    },
+    "wall_time": 19.529770135879517
+  },
+  "record": "matches/e2e_swapped.jsonl",
+  "seed": 42
+}

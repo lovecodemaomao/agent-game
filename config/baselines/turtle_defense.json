@@ -1,0 +1,14 @@
+{
+  "name": "turtle_defense",
+  "description": "对手基线：龟缩防御流，10天固定策略",
+  "harass_budget": 0.0,
+  "wall_density": 1.5,
+  "weapon_build_order": ["gatling", "gatling", "railgun"],
+  "task_tempo": 0.5,
+  "mine_preference": {"stone": 2, "iron": 2, "copper": 2},
+  "upgrade_priority": ["wall", "base", "weapon"],
+  "sell_timing": "immediate",
+  "sell_backpack_threshold": 10,
+  "wall_target_per_side": 8,
+  "base_hp_warn_ratio": 0.4
+}

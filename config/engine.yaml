@@ -1,0 +1,89 @@
+# 《未来战争》本地模拟引擎配置
+# 任务书未明确定义的机制全部在此参数化，禁止散落硬编码。
+
+map:
+  width: 41
+  height: 32
+  # 双方基地 2x2，给出左上角坐标（默认取自 docs/request.txt 样例）
+  challenger_base: [10, 24]
+  defender_base: [30, 7]
+  # 可建造区域：以基地矩形为参照的切比雪夫距离环带
+  weapon_zone: [1, 3]     # 蓝区：只能建武器（demo样例武器距基地距离1）
+  wall_zone: [4, 6]       # 黄区：只能建围墙
+  # 固定中立单位（样例默认值）
+  vendor: [20, 16]
+  weapon_shop: [25, 20]
+  task_points:
+    challenger:
+      point1: [[14, 14]]
+      point2: [[17, 17], [16, 17]]
+    defender:
+      point1: [[23, 14]]
+      point2: [[26, 17], [27, 17]]
+  mine_count: {stone: 3, iron: 3, copper: 3}   # 开局矿区数量（随机分布）
+
+economy:
+  mine_capacity: 10          # 每矿可采集次数
+  base_prices: {stone: 1, iron: 3, copper: 5}
+  initial_gold: 75
+
+robots:
+  pathing_model: direct      # direct=直线撞墙 / bfs=绕障搜索
+  wave_scale: 1.0            # 波次强度系数（扫描用：0.5 / 1.0 / 2.0）
+  # 每日基础波次公式: 数量 = round((a + b*day) * wave_scale)
+  wave_formula:
+    smallRobot:  {a: 2, b: 1}
+    middleRobot: {a: 0, b: 0.5}
+    largeRobot:  {a: -1, b: 0.5}   # day>=3 才出现（负值截断为0）
+    bossRobot:   {a: -4, b: 0.5}   # day>=9 起步，可被事件调整
+  spawn_radius: 8             # 在目标基地周围该切比雪夫半径内随机出生
+  attack_any_blocker: true    # 机器人是否攻击任何阵营的阻挡者（否则仅目标阵营）
+
+news:
+  official_event_prob: 0.7    # 每天出现官方事件的概率
+  collapse_duration: 2        # 塌方停采天数（事件次日开始）
+  collapse_price_mult: 2.0
+  discovery_duration: 2
+  discovery_price_mult: 0.5
+  surge_duration: 1
+  surge_price_mult: 1.5
+
+treasure:
+  clue_days: 5                # 传闻线索释放天数
+  window_start: 4             # 开启时间窗口起始日
+  window_end: 8               # 开启时间窗口结束日
+  reward_score: 100
+  reward_gold: 200
+  items_needed: 3             # 祭品数量
+
+tasks:
+  per_point_total: 5          # 每个任务点任务总数上限
+  cooldown_rounds: 30         # 任务结束后刷新冷却
+  timeout_rounds: 100         # 任务超时回合数（速度加成分母）
+  score_reward: 50
+  gold_reward: 30
+  weather_cities: [北京, 上海, 广州, 深圳, 成都, 杭州, 武汉, 西安]
+
+llm:
+  model: deepseek-flash  # 开发期可用模型（比赛期换平台提供的 deepseek-v4.1-flash）
+  base_url: https://api.deepseek.com
+  timeout: 60
+  retries: 2
+  daily_quota: 3              # 每队每游戏日非任务期调用上限
+  cache: true                 # 同 prompt 磁盘缓存（开发期）
+
+sandbox:
+  timeout: 15
+  max_output: 65536
+  block_external_network: true  # 通过 proxy 环境变量近似禁网
+
+judge:
+  connect_timeout: 10
+  response_deadline: 5        # 赛制值；本地调试可放宽
+  max_abnormal: 5
+  agents:
+    challenger: {module: agents.competitor.main}
+    defender: {module: agents.baseline.main}
+
+agent:
+  round_budget: 3.5           # agent 单回合内部计算预算（秒），须 < 判题器死线

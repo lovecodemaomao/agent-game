@@ -1,0 +1,14 @@
+{
+  "name": "balanced",
+  "description": "均衡发展：稳健经济+标准防御+积极任务",
+  "harass_budget": 0.0,
+  "wall_density": 1.0,
+  "weapon_build_order": ["gatling", "gatling", "railgun"],
+  "task_tempo": 0.7,
+  "mine_preference": {"stone": 1, "iron": 2, "copper": 3},
+  "upgrade_priority": ["base", "wall", "weapon"],
+  "sell_timing": "hold_on_surge",
+  "sell_backpack_threshold": 12,
+  "wall_target_per_side": 6,
+  "base_hp_warn_ratio": 0.5
+}

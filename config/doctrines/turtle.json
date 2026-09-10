@@ -1,0 +1,14 @@
+{
+  "name": "turtle",
+  "description": "龟缩防御：满围墙迷宫+重火力的生存优先策略",
+  "harass_budget": 0.0,
+  "wall_density": 1.6,
+  "weapon_build_order": ["gatling", "gatling", "rocket"],
+  "task_tempo": 0.4,
+  "mine_preference": {"stone": 3, "iron": 1, "copper": 2},
+  "upgrade_priority": ["wall", "base", "weapon"],
+  "sell_timing": "immediate",
+  "sell_backpack_threshold": 8,
+  "wall_target_per_side": 9,
+  "base_hp_warn_ratio": 0.35
+}
