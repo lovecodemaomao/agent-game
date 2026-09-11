@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 DAY_ROUNDS = 70
@@ -19,6 +19,13 @@ TOWER_RANGE_BY_LEVEL = {
     "railgun": (6, 8, 10),
     "rocket": (10, 15, 10**9),
 }
+# 升级券与修复（任务书 4.6.3）
+WALL_FIXER = "WallFixer"
+WALL_FIXER_PRICE = 10
+WALL_REPAIR_HP = 200          # 围墙血量低于该值优先修复
+WEAPON_VOUCHER_BY_LEVEL = {1: "WeaponUpgradeVoucher1", 2: "WeaponUpgradeVoucher2"}
+WALL_VOUCHER_BY_LEVEL = {1: "WallUpgradeVoucher1", 2: "WallUpgradeVoucher2"}
+STATION_VOUCHER_BY_LEVEL = {1: "StationUpgradeVoucher1", 2: "StationUpgradeVoucher2"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +114,29 @@ class Robot:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskPoint:
+    kind: str
+    pos: Pos
+    cold_down: int
+    is_valid: bool
+    timeout_rounds: int
+    score_reward: int = 0
+    gold_reward: int = 0
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "TaskPoint":
+        return cls(
+            str(raw.get("taskType") or ""),
+            Pos.load(raw["taskPosition"]),
+            int(raw.get("coldDownRounds") or 0),
+            bool(raw.get("isValid")),
+            int(raw.get("timeoutRounds") or 0),
+            int(raw.get("scoreReward") or 0),
+            int(raw.get("goldReward") or 0),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Turn:
     round_no: int
     is_day: bool
@@ -118,6 +148,16 @@ class Turn:
     robots: tuple[Robot, ...]
     enemies: tuple[Unit, ...] = ()
     team_type: str = ""
+    # 任务与沙盒回填（接口文档 1.1）
+    tasks: tuple[TaskPoint, ...] = ()
+    phase_task: str = ""
+    last_cmd_result: str = ""
+    llm_resp: str = ""
+    last_results: dict[int, bool] = field(default_factory=dict)
+
+    @property
+    def round_of_day(self) -> int:
+        return (self.round_no - 1) % ROUNDS_PER_DAY + 1
 
     @classmethod
     def load(cls, payload: dict[str, Any]) -> "Turn":
@@ -141,6 +181,11 @@ class Turn:
             ),
             tuple(Unit.load(role) for role in (payload.get("teamEnemy") or {}).get("roles") or ()),
             str(team.get("type", "")),
+            tuple(TaskPoint.load(t) for t in team.get("playerTasks") or ()),
+            str(payload.get("phaseTask") or ""),
+            str(payload.get("lastCmdResult") or ""),
+            str(payload.get("llmResp") or ""),
+            {int(k): bool(v) for k, v in (payload.get("lastRoundRoleActionResults") or {}).items()},
         )
 
     def station(self) -> Unit | None:
@@ -173,6 +218,28 @@ class Turn:
 
     def walls(self) -> tuple[Unit, ...]:
         return self.alive((WALL,))
+
+    def pioneer(self) -> Unit | None:
+        ps = self.alive((PIONEER,))
+        return ps[0] if ps else None
+
+    def mines(self) -> tuple[Pos, ...]:
+        return tuple(
+            pos for pos, kind in self.zones.items()
+            if kind in ("stone", "iron", "copper")
+        )
+
+    def vendors(self) -> tuple[Pos, ...]:
+        return tuple(pos for pos, kind in self.zones.items() if kind == "vendor")
+
+    def shops(self) -> tuple[Pos, ...]:
+        return tuple(pos for pos, kind in self.zones.items() if kind == "weaponShop")
+
+    def task_points(self) -> tuple[Pos, ...]:
+        return tuple(sorted(
+            (t.pos for t in self.tasks if t.is_valid),
+            key=lambda p: (p.x, p.y),
+        ))
 
     def stone_mines(self) -> tuple[Pos, ...]:
         return tuple(
@@ -223,3 +290,26 @@ def attack_command(controller_id: int, pos: Pos) -> dict[str, Any]:
         "targetPos": [pos.dump()],
         "controllerId": str(controller_id),
     }
+
+
+def sell_command(name: str, num: int) -> dict[str, Any]:
+    return {"action": "sell", "name": name, "num": int(num)}
+
+
+def buy_command(name: str, num: int = 1) -> dict[str, Any]:
+    return {"action": "buy", "name": name, "num": int(num)}
+
+
+def use_command(name: str, pos: Pos | None = None) -> dict[str, Any]:
+    command: dict[str, Any] = {"action": "use", "name": name}
+    if pos is not None:
+        command["targetPos"] = [pos.dump()]
+    return command
+
+
+def accept_task_command() -> dict[str, Any]:
+    return {"action": "acceptTask"}
+
+
+def submit_answer_command(answer: str) -> dict[str, Any]:
+    return {"action": "submitAnswer", "taskAnswer": answer}
