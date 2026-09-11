@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, Optional
 
@@ -33,21 +34,26 @@ class LLMProxy:
         self.history: Dict[str, list] = {"challenger": [], "defender": []}
         self.quota: Dict[str, Dict] = {t: {"day": 0, "used": 0} for t in ("challenger", "defender")}
         self.errors: Dict[str, list] = {"challenger": [], "defender": []}
-        self._pending: Dict[str, Future] = {}
+        self._pending: Dict[str, Any] = {}  # team -> deque[Future]（FIFO，保序回填）
         self.stats = {t: {"total": 0, "quota_used": 0, "rejected": 0} for t in ("challenger", "defender")}
 
     # ------------------------------------------------------------------
     def on_round(self, round_no: int, round_recs: Dict[str, Any]) -> None:
         day = R.day_of(round_no)
-        # 回收已完成的异步调用 -> 下回合回填
-        for team, fut in list(self._pending.items()):
-            if fut.done():
+        # 回收已完成的异步调用 -> 下回合按 FIFO 回填（每回合一个 llmResp，
+        # 与《接口文档》"上回合LLM返回的响应内容"一致；不能用单槽，
+        # 否则连续每回合发 prompt 的 agent 会永远收不到响应）
+        for team, queue in list(self._pending.items()):
+            while queue and queue[0].done():
+                fut = queue.popleft()
                 try:
                     resp = fut.result()
                 except Exception as e:
                     resp = f"[LLM_ERROR] {e}"
                 if self.provider is not None:
                     self.provider.llm_resp[team] = resp
+                break  # 每回合只回填一条，保持与回合一一对应
+            if not queue:
                 del self._pending[team]
         # 处理本轮 prompt
         for team, rec in round_recs["teams"].items():
@@ -71,7 +77,7 @@ class LLMProxy:
                 self.stats[team]["quota_used"] += 1
             self.stats[team]["total"] += 1
             fut = self.executor.submit(self._call, team, prompt)
-            self._pending[team] = fut
+            self._pending.setdefault(team, deque()).append(fut)
 
     def errors_for(self, team: str):
         errs = self.errors[team]

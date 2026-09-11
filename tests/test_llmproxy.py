@@ -89,8 +89,9 @@ print("7.2 context isolation ok")
 
 # -- 回填验证 --
 time.sleep(0.3)
-for team, fut in list(px3._pending.items()):
-    provider3.llm_resp[team] = fut.result()
+for team, queue in list(px3._pending.items()):
+    if queue:
+        provider3.llm_resp[team] = queue[0].result()
 assert "challenger" in provider3.llm_resp
 print("llm_resp backfill ok")
 

@@ -1,37 +1,19 @@
 """Basic defense: two rockets, one railgun, forward walls and mining economy.
 
-修复三项逻辑:
-  1. 开拓者接入自进化任务（接任务/解题/提交，经平台 prompt+executeCmd 通道）
-  2. 采矿改为就近优先（同价矿取最近，行程接近时优先高价矿），不再舍近求远
-  3. 升级券与修墙包真正采购落地（武器优先，围墙血量<200 优先修复）
+Generic tasks use the judge LLM/sandbox channel; movement and economy stay local.
 """
 from collections import Counter
 from itertools import permutations, combinations
-from typing import Any
 
 from .grid import Routes, neighbours
-from .protocol import (
-    Pos, Turn, Unit, distance, station_footprint, build_command, move_command,
-    sell_command, buy_command, use_command, accept_task_command,
-    WALL_FIXER, WALL_REPAIR_HP, WALL_VOUCHER_BY_LEVEL, STATION_VOUCHER_BY_LEVEL,
-    WEAPON_VOUCHER_BY_LEVEL,
-)
-from .tasks import TaskAgent
+from .memory import Memory
+from .geography import Geography
+from .economy import Economy
+from .tasks import Tasks
+from .protocol import Pos, Turn, distance, station_footprint, move_command
 
 LOADOUT = ("rocket", "rocket", "railgun")
 RETURN_MARGIN = 5
-MINERALS = ("stone", "iron", "copper")
-MAX_HP = {"station": (1500, 3000, 4500), "rocket": (1000, 1500, 2000),
-          "railgun": (1000, 1500, 2000), "gatling": (1000, 1500, 2000),
-          "wall": (1000, 1500, 2000)}
-MIN_TASK_BUDGET = 12          # 接任务至少预留的回合预算（够解题 + 返程）
-# 动作失败反馈: {(unit_id, action, x, y): 失效回合}，避免同一非法动作反复重试
-FAILED_ACTIONS: dict[tuple, int] = {}
-FAILED_TTL = 4
-_LAST_COMMAND: dict[int, tuple] = {}
-# 黏性矿点: 工人锁定当前矿持续开采，矿枯竭/被封禁才换点（避免跨图追逐）
-STICKY_MINE: dict[int, Pos] = {}
-_TASK_AGENT = TaskAgent()
 
 
 def ring(turn, radius):
@@ -57,73 +39,52 @@ def wall_sites(turn):
                         key=lambda p: (-sign*(p.x-center_x), abs(p.y-(station.pos.y-0.5)), p.y)))
 
 
-def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """返回 roleCommandMap（保持原有调用约定）。"""
-    commands, _extras = plan(payload)
-    return commands
-
-
-def respond(payload: dict[str, Any]) -> dict[str, Any]:
-    """返回完整 Response 报文（接口文档 2.1: roleCommandMap + prompt + executeCmd）。"""
-    commands, extras = plan(payload)
-    return {"roleCommandMap": commands, "prompt": extras["prompt"],
-            "executeCmd": extras["executeCmd"]}
-
-
-def plan(payload: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+def decide_response(payload, memory=None):
+    memory = memory if memory is not None else Memory()
     turn = Turn.load(payload)
+    memory.observe(turn,payload)
     if turn.station() is None or turn.station().health <= 0:
-        return {}, {"prompt": "", "executeCmd": ""}
-    planner = Planner(turn, payload)
-    commands = planner.run()
-    return commands, {"prompt": planner.prompt, "executeCmd": planner.execute_cmd}
+        response = {'roleCommandMap':{},'prompt':'','executeCmd':''}
+    else:
+        planner = Planner(turn,payload,memory)
+        response = {'roleCommandMap':planner.run(), 'prompt':planner.prompt,
+                    'executeCmd':planner.execute_cmd}
+    memory.remember(turn,response)
+    return response
+
+
+def decide(payload, memory=None):
+    # Compatibility for existing standalone users; HTTP uses the full response.
+    return decide_response(payload,memory)['roleCommandMap']
 
 
 class Planner:
-    def __init__(self, turn, payload):
+    def __init__(self, turn, payload, memory=None):
         self.turn = turn
+        self.memory = memory if memory is not None else Memory(day=(turn.round_no-1)//130+1)
+        self.geo = Geography(turn)
+        self.engaged = set()
+        self.prompt = ''
+        self.execute_cmd = ''
         self.payload = payload
         self.commands = {}
         self.reserved = set()
         self.gold = turn.gold
         self.built = []
         self.build_targets = set()
-        self.upgrade_targets = set()
-        self.pending = Counter(item for u in turn.controllable() for item in u.backpack)
-        self.prices = {x['name']: int(x['price']) for x in payload.get('vendorShopList', [])}
+        self.prices = {x['name']: float(x['price']) for x in payload.get('vendorShopList', [])}
         self.shop_prices = {x['name']: int(x['price']) for x in payload.get('weaponShopList', [])}
         self.walls = wall_sites(turn)
         self.home_cost_cache = {}
         self.remaining = 70 - (turn.round_no - 1) % 130
-        self.prompt = ""
-        self.execute_cmd = ""
-        # 上回合动作失败的记录 -> 本回合绕开同一动作
-        self.failed = set()
-        for (uid, action, key) in list(FAILED_ACTIONS):
-            if FAILED_ACTIONS[(uid, action, key)] <= turn.round_no:
-                del FAILED_ACTIONS[(uid, action, key)]
-        for uid, ok in turn.last_results.items():
-            if ok:
-                continue
-            previous = _LAST_COMMAND.get(uid)
-            if previous is not None:
-                action, key = previous
-                FAILED_ACTIONS[(uid, action, key)] = turn.round_no + FAILED_TTL
-        for (uid, action, key), until in FAILED_ACTIONS.items():
-            if until > turn.round_no:
-                self.failed.add((uid, action, key))
-
-    def allowed(self, role, action, target=None) -> bool:
-        """该角色对目标执行该动作是否未被封禁（用于规避重复失败）。"""
-        key = None if target is None else (target.x, target.y)
-        return (role.unit_id, action, key) not in self.failed
-
-    def record(self, role, action, target=None) -> None:
-        key = None if target is None else (target.x, target.y)
-        _LAST_COMMAND[role.unit_id] = (action, key)
+        self.economic = Economy(self)
 
     def route(self, role):
-        return Routes(self.turn, role, self.reserved)
+        forbidden = set(self.reserved)
+        failed = self.memory.failed_steps.get(role.unit_id)
+        if failed and failed[1] >= self.turn.round_no:
+            forbidden.add(failed[0])
+        return Routes(self.turn, role, forbidden)
 
     def move(self, role, routes, stand):
         if stand is None:
@@ -174,71 +135,29 @@ class Planner:
                 self.home_cost(role, stand) + RETURN_MARGIN < self.remaining)
 
     def run(self):
+        Tasks(self).run()
+        self.economic.prepare()
         if not self.turn.is_day:
             self.night()
             return self.commands
-        self.pioneer_day()
-        for role in self.turn.workers():
+        workers = self.turn.workers()
+        maintenance = next((r.unit_id for r in workers
+                            if self.memory.jobs.get(r.unit_id,{}).get('type')!='upgrade'),None)
+        for role in workers:
             routes = self.route(role)
+            # Using a voucher in place takes one turn and must not be suppressed
+            # by the generic five-turn return margin.
+            if self.economic.upgrade(role,routes):
+                continue
             if self.remaining <= self.home_cost(role, role.pos) + RETURN_MARGIN:
-                continue
-            if self.deliver_upgrade(role, routes):
-                continue
-            if self.repair_wall(role, routes):
                 continue
             if self.build_tower(role, routes):
                 continue
-            if self.procure_upgrade(role, routes):
+            if (self.memory.day==1 or role.unit_id==maintenance) and self.build_wall(role,routes):
                 continue
-            if self.build_wall(role, routes):
-                continue
-            self.economy(role, routes)
-        # Workers with no productive action and the pioneer occupy useful seats.
+            self.economic.act(role,routes)
         self.assign_towers(day=True)
         return self.commands
-
-    # ------------------------ 修复问题1: 开拓者做任务 ------------------------
-    def pioneer_day(self):
-        pioneer = self.turn.pioneer()
-        if pioneer is None:
-            return
-        routes = self.route(pioneer)
-        home_needed = self.remaining <= self.home_cost(pioneer, pioneer.pos) + RETURN_MARGIN
-        if self.turn.phase_task:
-            # 任务进行中: 到点后由任务代理推进（解题/提交）
-            anchor = self._task_anchor(pioneer)
-            if anchor is not None and distance(pioneer.pos, anchor) > 1:
-                if not home_needed:
-                    self.move(pioneer, routes, routes.adjacent(anchor))
-                return
-            command, prompt, execute_cmd = _TASK_AGENT.step(self.turn)
-            self.prompt = prompt
-            self.execute_cmd = execute_cmd
-            if command is not None:
-                self.commands[str(pioneer.unit_id)] = command
-                self.record(pioneer, command["action"])
-            return
-        if home_needed:
-            return
-        # 未接任务: 有足够预算时前往任务点领取
-        if self.remaining < self.home_cost(pioneer, pioneer.pos) + RETURN_MARGIN + MIN_TASK_BUDGET:
-            return
-        for target in sorted(self.turn.task_points(), key=routes.distance):
-            stand = routes.adjacent(target)
-            if stand is None or not self.enough_time(pioneer, routes, target, 1):
-                continue
-            if stand == pioneer.pos:
-                self.commands[str(pioneer.unit_id)] = accept_task_command()
-                self.record(pioneer, 'acceptTask')
-            else:
-                self.move(pioneer, routes, stand)
-            return
-
-    def _task_anchor(self, pioneer) -> Pos | None:
-        points = tuple(t.pos for t in self.turn.tasks) or self.turn.task_points()
-        if not points:
-            return None
-        return min(points, key=lambda p: distance(pioneer.pos, p))
 
     def build_tower(self, role, routes):
         towers = self.turn.weapons()
@@ -280,14 +199,15 @@ class Planner:
         stock = role.backpack.count('stone')
         batch = min(3, (len(missing)+1)//2)
         nearby = [p for p, kind in self.turn.zones.items()
-                  if kind == 'stone' and distance(role.pos, p) <= 1]
+                  if kind == 'stone' and distance(role.pos, p) <= 1
+                  and not self.economic.blocked(p,kind)]
         if nearby and stock < batch and not role.backpack_full:
             target = nearby[0]
             if self.enough_time(role, routes, target, batch-stock):
                 return self.interact(role, routes, target, 'collect', targetPos=[target.dump()])
         if not stock:
             # Once established, reserve only a small stone batch per trip.
-            mines = [p for p, kind in self.turn.zones.items() if kind == 'stone']
+            mines = [p for p, kind in self.turn.zones.items() if kind == 'stone' and not self.economic.blocked(p,kind)]
             for target in sorted(mines, key=routes.distance):
                 if not role.backpack_full and self.enough_time(role, routes, target, 3):
                     return self.interact(role, routes, target, 'collect', targetPos=[target.dump()])
@@ -302,158 +222,18 @@ class Planner:
         return False
 
     def upgrade_options(self):
-        """可按优先级采购/使用的升级券: 低血基地 > 火箭 > 基地 > 其它武器 > 围墙。
+        return self.economic.options()
 
-        注意武器/基地优先于围墙（"优先升级武器"），围墙券价格低(20/30)，
-        在金币有限时也能落地。
-        """
-        station = self.turn.station()
-        result = []
-        for target in (*self.turn.weapons(), station, *self.turn.walls()):
-            if target.level >= 3 or target.unit_id in self.upgrade_targets:
-                continue
-            if target.kind == 'wall':
-                name = WALL_VOUCHER_BY_LEVEL[max(1, target.level)]
-                priority = 4
-            elif target.kind == 'station':
-                name = STATION_VOUCHER_BY_LEVEL[max(1, target.level)]
-                hp = MAX_HP['station'][max(1, target.level) - 1]
-                priority = 0 if target.health < hp * 0.6 else 2
-            else:
-                name = WEAPON_VOUCHER_BY_LEVEL[max(1, target.level)]
-                priority = 1 if target.kind == 'rocket' else 3
-            result.append((priority, target.level, target.unit_id, name, target))
-        return sorted(result, key=lambda x: x[:3])
+    def deliver_upgrade(self,role,routes):
+        self.economic.prepare()
+        return self.economic.upgrade(role,routes)
 
-    def damaged_walls(self):
-        """血量低于阈值的围墙（按血量升序，最危险的优先修复）。"""
-        return sorted((w for w in self.turn.walls() if w.health < WALL_REPAIR_HP),
-                      key=lambda w: (w.health, w.pos.x, w.pos.y))
-
-    def repair_wall(self, role, routes):
-        """围墙血量低于阈值时优先修复（先用手上的修复包，否则去买）。"""
-        damaged = self.damaged_walls()
-        if not damaged:
-            return False
-        target = damaged[0]
-        if WALL_FIXER in role.backpack:
-            if not self.allowed(role, 'use', target.pos):
-                return False
-            if self.interact(role, routes, target.pos, 'use',
-                             name=WALL_FIXER, targetPos=[target.pos.dump()]):
-                self.record(role, 'use', target.pos)
-                return True
-            return False
-        price = self.shop_prices.get(WALL_FIXER)
-        shop = self._nearest_shop(routes)
-        if price is None or shop is None or price > self.gold or self.pending[WALL_FIXER]:
-            return False
-        if not self.enough_time(role, routes, shop, 2):
-            return False
-        if not self.allowed(role, 'buy'):
-            return False
-        if self.interact(role, routes, shop, 'buy', name=WALL_FIXER, num=1):
-            self.gold -= price
-            self.pending[WALL_FIXER] += 1
-            self.record(role, 'buy')
-            return True
-        return False
-
-    def procure_upgrade(self, role, routes):
-        """主动采购升级券（不再淹没在采矿分支之后，保证金币到位就能买）。"""
-        shop = self._nearest_shop(routes)
-        if shop is None or role.backpack_full:
-            return False
-        if not self.enough_time(role, routes, shop, 3):
-            return False
-        return self._try_buy(role, routes, shop)
-
-    def _nearest_shop(self, routes):
-        shops = self.turn.shops()
-        return min(shops, key=routes.distance, default=None)
-
-    def _try_buy(self, role, routes, shop):
-        options = self.upgrade_options()
-        rebuild_reserve = 25 * max(0, 3 - len(self.turn.weapons()) - len(self.built))
-        for _, _, _, name, _target in options:
-            price = self.shop_prices.get(name)
-            eligible = sum(option[3] == name for option in options)
-            if price is None or self.pending[name] >= eligible or price > self.gold - rebuild_reserve:
-                continue
-            if not self.allowed(role, 'buy'):
-                return False
-            if self.interact(role, routes, shop, 'buy', name=name, num=1):
-                self.gold -= price  # Reserve even while this worker travels.
-                self.pending[name] += 1
-                self.record(role, 'buy')
-                return True
-        return False
-
-    def deliver_upgrade(self, role, routes):
-        for _, _, _, name, target in self.upgrade_options():
-            if name in role.backpack and self.enough_time(role, routes, target.pos):
-                if not self.allowed(role, 'use', target.pos):
-                    continue
-                if self.interact(role, routes, target.pos, 'use',
-                                 name=name, targetPos=[target.pos.dump()]):
-                    self.upgrade_targets.add(target.unit_id)
-                    self.record(role, 'use', target.pos)
-                    return True
-        return False
-
-    def economy(self, role, routes):
-        minerals = Counter(x for x in role.backpack if x in MINERALS)
-        vendors = [p for p, k in self.turn.zones.items() if k == 'vendor']
-        shops = [p for p, k in self.turn.zones.items() if k == 'weaponShop']
-        vendor = min(vendors, key=routes.distance, default=None)
-        shop = min(shops, key=routes.distance, default=None)
-        # Sell in batches, but cash out smaller loads before a late return.
-        value = sum(n*self.prices.get(k, 0) for k, n in minerals.items())
-        # 阈值下调: 6 个矿或 24 金即兑现，避免矿枯竭/换点时永远攒不满而颗粒无收
-        should_sell = role.backpack_full or value >= 24 or sum(minerals.values()) >= 6
-        if vendor is not None:
-            should_sell |= bool(minerals) and (routes.distance(vendor) == 0 or
-                self.remaining < routes.distance(vendor) + self.home_cost(role, vendor) + 15)
-        if minerals and vendor is not None and should_sell and self.enough_time(role, routes, vendor, len(minerals)):
-            name = max(minerals, key=lambda k: minerals[k]*self.prices.get(k, 0))
-            if self.interact(role, routes, vendor, 'sell', name=name, num=minerals[name]):
-                self.record(role, 'sell', vendor)
-                return
-        if shop is not None and not role.backpack_full and self.enough_time(role, routes, shop, 3):
-            if self._try_buy(role, routes, shop):
-                return
-        if role.backpack_full:
-            return
-        # 采矿: 就近优先 —— 优先锁定当前矿点（黏性），矿枯竭或不可达才重新选点；
-        # 选点按"去矿 + 去小贩"总行程最短，行程接近时优先高价矿。
-        sticky = STICKY_MINE.get(role.unit_id)
-        if (sticky is not None and self.turn.zones.get(sticky) in MINERALS
-                and self.allowed(role, 'collect', sticky)
-                and self.enough_time(role, routes, sticky, 3)):
-            if self.interact(role, routes, sticky, 'collect', targetPos=[sticky.dump()]):
-                self.record(role, 'collect', sticky)
-                return
-        candidates = []
-        for target, kind in self.turn.zones.items():
-            if kind not in MINERALS or self.prices.get(kind, 0) <= 0:
-                continue
-            if not self.allowed(role, 'collect', target):
-                continue
-            if not self.enough_time(role, routes, target, 3):
-                continue
-            distance_to_mine = routes.distance(target)
-            selling = min((distance(target, p) for p in vendors), default=100)
-            travel = distance_to_mine + selling
-            candidates.append((travel, -self.prices.get(kind, 0), distance_to_mine, target))
-        if candidates:
-            candidates.sort()
-            target = candidates[0][3]
-            STICKY_MINE[role.unit_id] = target
-            if self.interact(role, routes, target, 'collect', targetPos=[target.dump()]):
-                self.record(role, 'collect', target)
+    def economy(self,role,routes):
+        self.economic.prepare()
+        return self.economic.act(role,routes)
 
     def assign_towers(self, day=False):
-        roles = [r for r in self.turn.controllable() if str(r.unit_id) not in self.commands]
+        roles = [r for r in self.turn.controllable() if str(r.unit_id) not in self.commands and r.unit_id not in self.engaged]
         towers = list(self.turn.weapons())
         if not roles or not towers:
             return []
@@ -481,6 +261,8 @@ class Planner:
         remaining = {r.robot_id: r.health for r in self.turn.robots if r.health > 0}
         for role, tower in sorted(ready, key=lambda pair: pair[1].kind != 'rocket'):
             if tower.cooldown > 0:
+                if self.economic.upgrade(role,self.route(role)):
+                    continue
                 if 'Medicine' in role.backpack and role.health < 100:
                     self.commands[str(role.unit_id)] = {'action': 'use', 'name': 'Medicine'}
                 continue

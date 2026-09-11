@@ -3,7 +3,9 @@ import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from .brain import respond
+from .runtime import Agent
+
+AGENT = Agent()
 
 LOGGER = logging.getLogger(__name__)
 
@@ -14,9 +16,11 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         try:
             payload = json.loads(raw.decode("utf-8"))
-            response = respond(payload)
+            response = AGENT.respond(payload)
             LOGGER.info("round %s -> %s", payload.get("roundNo"), response)
-            body = json.dumps(response, ensure_ascii=False).encode("utf-8")
+            body = json.dumps(
+                response, ensure_ascii=False,
+            ).encode("utf-8")
         except Exception:
             LOGGER.exception("decision failed")
             body = b'{"roleCommandMap":{},"prompt":"","executeCmd":""}'
