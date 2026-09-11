@@ -132,7 +132,7 @@ class BasicStrategyTests(unittest.TestCase):
         self.assertEqual(planner.commands['2'],{'action':'sell','name':'copper','num':10})
 
     def test_upgrade_purchase_budget_and_delivery(self):
-        p=fixture(); p['teamOur']['goldNum']=100
+        p=fixture(); p['roundNo']=131; p['teamOur']['goldNum']=100
         p['teamOur']['roles'] += [unit(10,'rocket',9,23),unit(11,'rocket',12,23),unit(12,'railgun',11,25)]
         p['mapInfo']['zones']=[{'pos':{'x':8,'y':24},'neutralType':'weaponShop'}]
         planner=Planner(Turn.load(p),p); role=planner.turn.workers()[0]
