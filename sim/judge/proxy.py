@@ -39,23 +39,14 @@ class LLMProxy:
 
     # ------------------------------------------------------------------
     def on_round(self, round_no: int, round_recs: Dict[str, Any]) -> None:
+        """按《接口文档》语义回填 llmResp: 本回合的 prompt 在回合内调用 LLM，
+        下一回合 request.llmResp 返回其结果（同步等待，与真实判题器一致）。
+
+        早期实现用后台线程+队列异步回填：回合推进远快于 LLM 延迟时，
+        请求方收到的是"迟到的、非上一回合"的响应，破坏了接口文档约定的
+        1 回合延迟，使按 request_id 校验回复的 agent 永远匹配不上。
+        """
         day = R.day_of(round_no)
-        # 回收已完成的异步调用 -> 下回合按 FIFO 回填（每回合一个 llmResp，
-        # 与《接口文档》"上回合LLM返回的响应内容"一致；不能用单槽，
-        # 否则连续每回合发 prompt 的 agent 会永远收不到响应）
-        for team, queue in list(self._pending.items()):
-            while queue and queue[0].done():
-                fut = queue.popleft()
-                try:
-                    resp = fut.result()
-                except Exception as e:
-                    resp = f"[LLM_ERROR] {e}"
-                if self.provider is not None:
-                    self.provider.llm_resp[team] = resp
-                break  # 每回合只回填一条，保持与回合一一对应
-            if not queue:
-                del self._pending[team]
-        # 处理本轮 prompt
         for team, rec in round_recs["teams"].items():
             prompt = (rec.get("response") or {}).get("prompt", "")
             if not prompt:
@@ -76,8 +67,12 @@ class LLMProxy:
                 q["used"] += 1
                 self.stats[team]["quota_used"] += 1
             self.stats[team]["total"] += 1
-            fut = self.executor.submit(self._call, team, prompt)
-            self._pending.setdefault(team, deque()).append(fut)
+            try:
+                resp = self._call(team, prompt)
+            except Exception as e:
+                resp = f"[LLM_ERROR] {e}"
+            if self.provider is not None:
+                self.provider.llm_resp[team] = resp
 
     def errors_for(self, team: str):
         errs = self.errors[team]
