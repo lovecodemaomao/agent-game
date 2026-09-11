@@ -8,8 +8,8 @@ map:
   challenger_base: [10, 24]
   defender_base: [30, 7]
   # 可建造区域：以基地矩形为参照的切比雪夫距离环带
-  weapon_zone: [1, 3]     # 蓝区：只能建武器（demo样例武器距基地距离1）
-  wall_zone: [4, 6]       # 黄区：只能建围墙
+  weapon_zone: [1, 1]     # 蓝区：只能建武器（官方demo口径: 距基地1）
+  wall_zone: [2, 8]       # 黄区：只能建围墙（官方demo口径: 距基地2起）
   # 固定中立单位（样例默认值）
   vendor: [20, 16]
   weapon_shop: [25, 20]

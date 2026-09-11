@@ -204,7 +204,7 @@ class Resolver:
             return False
         d = w.zone_distance(tp, team)
         if name == "wall":
-            if not (4 <= d <= self.cfg.raw["map"]["wall_zone"][1]):
+            if not (self.cfg.raw["map"]["wall_zone"][0] <= d <= self.cfg.raw["map"]["wall_zone"][1]):
                 return False
             if u.backpack.count("stone") < 1:
                 return False

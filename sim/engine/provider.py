@@ -49,6 +49,7 @@ class EngineProvider:
         req = build_request(self.w, self.cfg, team,
                             llm_resp=self.llm_resp.pop(team, ""),
                             errors=errors)  # 送达即清，避免黏滞
+        req["roundNo"] = round_no  # 判题循环的权威回合号（引擎状态可能尚未推进一步）
         return req
 
     def consume(self, team: str, round_no: int, response: Dict[str, Any], meta: Dict[str, Any]) -> None:

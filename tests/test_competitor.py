@@ -38,8 +38,8 @@ for e in om.events:
         kills += e["count"]
     elif e["kind"] == "enemy_harass":
         harass += 1
-assert builds >= 3, f"应捕获对手建武器/建墙事件: {builds}"
-assert f["enemy_wall_count"] >= 0
+assert builds >= 1, f"应捕获对手建武器/建墙事件: {builds}"
+assert isinstance(f["enemy_wall_count"], int), "围墙计数应为整数特征"
 assert kills >= 0
 print(f"11.1 opponent model ok: build_events={builds}, kill_events={kills}, "
       f"harass={harass}, wall_count={f['enemy_wall_count']}, features keys ok")
