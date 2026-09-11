@@ -198,20 +198,25 @@ class Planner:
             return False
         stock = role.backpack.count('stone')
         batch = min(3, (len(missing)+1)//2)
+        # 采石分工: 只有被指派采石的工人去攒石头，另一名工人留给经济模块采矿石，
+        # 避免"两人都去采石头"导致矿石收入为零（需求2）。
+        stone_fetcher = self.economic.family(role) == 'stone'
         nearby = [p for p, kind in self.turn.zones.items()
                   if kind == 'stone' and distance(role.pos, p) <= 1
                   and not self.economic.blocked(p,kind)]
-        if nearby and stock < batch and not role.backpack_full:
+        if stone_fetcher and nearby and stock < batch and not role.backpack_full:
             target = nearby[0]
             if self.enough_time(role, routes, target, batch-stock):
                 return self.interact(role, routes, target, 'collect', targetPos=[target.dump()])
-        if not stock:
+        if not stock and stone_fetcher:
             # Once established, reserve only a small stone batch per trip.
             mines = [p for p, kind in self.turn.zones.items() if kind == 'stone' and not self.economic.blocked(p,kind)]
             for target in sorted(mines, key=routes.distance):
                 if not role.backpack_full and self.enough_time(role, routes, target, 3):
                     return self.interact(role, routes, target, 'collect', targetPos=[target.dump()])
             return False
+        if not stock:
+            return False        # 非采石工且手上无石头 -> 交给经济模块去采矿石
         for target in sorted(missing, key=lambda p: (self.walls.index(p)//4, routes.distance(p))):
             if self.enough_time(role, routes, target) and self.interact(
                     role, routes, target, 'build', name='wall', targetPos=[target.dump()]):

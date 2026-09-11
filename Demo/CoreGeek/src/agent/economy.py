@@ -14,25 +14,43 @@ class Economy:
         self.mine_claims=Counter()
 
     def options(self):
+        """升级/修复候选，按天数调整优先级（需求3）:
+
+        - 第1天: 武器升级优先（尽量当天把武器升上去）
+        - 第2天起: 先把围墙升到 2 级（迎敌半圈），随后若还有余量时间与金钱，
+          再回头升武器；围墙 2->3 级排在武器之后
+        - 与天数无关的保命项始终最优先: 濒危基地(<60%血)、三级残血墙的 WallFixer
+        """
         options=[]
+        # 天数兜底: memory.day 未初始化时按回合号推导，保证优先级判断稳定
+        day=self.m.day or ((self.turn.round_no-1)//130+1)
+        weapon_first=day<=1
+        # 围墙阶段: 迎敌半圈的主要墙体（≥一半）升到2级前，围墙券优先于武器券；
+        # 达标后武器升级接管（需求3: 围墙升级成功后若还有余量，再执行武器升级）。
+        # 若不设这个"阶段完成"判据，10 座墙的券会一直插队，武器永远升不上去。
+        all_walls=self.turn.walls()
+        wall_done=sum(1 for w in all_walls if max(1,min(3,w.level))>=2)
+        wall_phase=bool(all_walls) and wall_done < max(1,len(all_walls)//2)
         for u in (*self.turn.weapons(), *self.turn.walls(), self.turn.station()):
             if u is None: continue
             level=max(1,min(3,u.level)); ratio=u.health/HP[u.kind][level-1]
             if u.kind=='wall' and level==3:
                 if ratio>=0.7: continue
                 item='WallFixer'; priority=0 if ratio<0.35 else 4
+            elif u.kind=='station' and ratio<0.6 and level<3:
+                item=f'StationUpgradeVoucher{level}'; priority=0
             else:
                 if level>=3: continue
                 prefix='Station' if u.kind=='station' else 'Wall' if u.kind=='wall' else 'Weapon'
                 item=f'{prefix}UpgradeVoucher{level}'
-                if u.kind=='station' and ratio<0.6: priority=0
-                elif u.kind=='wall' and ratio<0.5: priority=0.5
-                elif u.kind=='rocket' and level==1: priority=1
-                elif u.kind=='wall' and level==1: priority=2
-                elif u.kind=='rocket': priority=3
-                elif u.kind=='railgun': priority=4
-                elif u.kind=='wall': priority=5
-                else: priority=4
+                if u.kind=='wall':
+                    # 围墙1->2级: 第1天让位武器; 第2天起在围墙阶段优先, 阶段完成后让位武器
+                    priority = (2 if level==1 else 2.5) if weapon_first else \
+                               (1 if (level==1 and wall_phase) else 3)
+                elif u.kind=='rocket':
+                    priority=1 if weapon_first else (3 if wall_phase else 1)
+                else:                      # railgun / gatling
+                    priority=1.5 if weapon_first else (3.5 if wall_phase else 1.5)
             # Favor forward, damaged walls rather than uniformly buying every wall.
             priority += (0 if u.kind!='wall' else (0 if u.pos in self.p.walls else 2)+ratio*0.1)
             options.append((priority,level,u.unit_id,item,u))
@@ -73,7 +91,11 @@ class Economy:
         for priority,level,uid,item,target in self.options():
             price=self.p.shop_prices.get(item)
             if price is None or price>self.p.gold: continue
-            if self.m.day==1 and self.p.missing_walls() and priority>=1: continue
+            # 第一天: 围墙是"用石头现场建"的，不得用采购额度抢武器升级的预算；
+            # 武器升级券与保命项照常允许（需求3: 武器升级尽量在第一天完成）。
+            day=self.m.day or ((self.turn.round_no-1)//130+1)
+            if day==1 and self.p.missing_walls() and not item.startswith('Weapon'):
+                continue
             choices=[]
             for role in self.turn.workers():
                 if role.backpack_full: continue
@@ -126,6 +148,38 @@ class Economy:
         return any(e['kind']==kind and e['start_day']<=self.m.day<=e['end_day']
                    for e in self.m.news_advice.get('blocked_mines',[]))
 
+    # ---------------------------------------------------------------- 矿工分工
+    def stone_needed(self):
+        """是否还需要专人采石: 建墙缺格 或 在途石头不足以补齐。"""
+        missing=len(self.p.missing_walls())
+        if missing<=0: return False
+        stock=sum(r.backpack.count('stone') for r in self.turn.workers())
+        return stock<missing
+
+    def family(self,role):
+        """矿工分工: 固定一名采石工供建墙材料，其余工采矿(铁/铜)。
+
+        避免两人都去采石导致矿石收入为零（效率过低）。
+        墙建齐或石头足够时全员转为采矿。
+        """
+        workers=sorted(self.turn.workers(),key=lambda r:r.unit_id)
+        ids=[r.unit_id for r in workers]
+        if not ids: return 'ore'
+        if not self.stone_needed():
+            self.m.mining_roles={}
+            return 'ore'
+        stone_id=self.m.mining_roles.get('stone')
+        if stone_id not in ids:
+            # 固定取 unit_id 最小者采石，其余采矿（不随回合漂移）
+            stone_id=ids[0]
+            self.m.mining_roles={'stone':stone_id}
+            self.m.event(f'worker {stone_id}: assigned to stone, others to ore')
+        return 'stone' if role.unit_id==stone_id else 'ore'
+
+    def wanted_kinds(self,role):
+        fam=self.family(role)
+        return ('stone',) if fam=='stone' else ('iron','copper')
+
     def sale_candidates(self,role,routes,extra=None):
         stock=Counter(x for x in role.backpack if x in ORES)
         if extra: stock.update(extra)
@@ -143,7 +197,7 @@ class Economy:
                         'vendor':vendor,'seat':seat,'total':total,'stock':stock,'value':value})
         return candidates
 
-    def mining_candidates(self,role,routes):
+    def mining_candidates(self,role,routes,kinds=None):
         capacity=max(0,(role.capacity or 100)-len(role.backpack))
         if not capacity: return []
         stock=Counter(x for x in role.backpack if x in ORES)
@@ -153,6 +207,7 @@ class Economy:
         for mine,kind in self.turn.zones.items():
             price=self.p.prices.get(kind,0)
             if kind not in ORES or price<=0 or self.blocked(mine,kind): continue
+            if kinds is not None and kind not in kinds: continue
             quantity=min(capacity,max(1,10-self.m.mine_used.get(mine,0)-self.mine_claims[mine]))
             sales=len(set(stock)|{kind})
             for entry in self.p.geo.seats(mine):
@@ -218,7 +273,11 @@ class Economy:
                 if self.sell(role,routes,sale): return True
             self.m.jobs.pop(role.unit_id,None)
         sales=self.sale_candidates(role,routes)
-        mines=self.mining_candidates(role,routes)
+        # 分工采集: 采石工只去石矿, 其余工只去铁矿/铜矿; 本工种无可用矿时回退到全部矿种
+        kinds=self.wanted_kinds(role)
+        mines=self.mining_candidates(role,routes,kinds)
+        if not mines:
+            mines=self.mining_candidates(role,routes)
         sale=max(sales,key=lambda x:x['score'],default=None)
         mine=max(mines,key=lambda x:x['score'],default=None)
         value=sum(self.p.prices.get(k,0) for k in role.backpack if k in ORES)

@@ -24,6 +24,7 @@ class Memory:
     last_roles: dict = field(default_factory=dict)
     mine_used: dict = field(default_factory=dict)
     mine_blocked_until: dict = field(default_factory=dict)
+    mining_roles: dict = field(default_factory=dict)   # 矿工分工: {'stone': unit_id}
     previous_mines: dict = field(default_factory=dict)
     failed_steps: dict = field(default_factory=dict)
     response: dict | None = None

@@ -19,6 +19,24 @@ def task_fixture():
     return p
 
 
+def advance_probes(p, m, start=2, limit=8):
+    """推进固定探测阶段，直到本回合开始请求 LLM；返回 (该回合号, 该回合响应)。
+
+    探测期只发射固定命令、不消耗 LLM 额度、也不发 prompt。
+    """
+    n = start
+    for _ in range(limit):
+        p['roundNo'] = n
+        p['llmResp'] = ''
+        r = decide_response(p, m)
+        if r['prompt']:
+            return n, r
+        assert r['executeCmd'], f'探测阶段第{n}回合既无探测命令也无LLM请求: {r}'
+        p['lastCmdResult'] = '[exitCode:0]\nprobe output at round %d' % n
+        n += 1
+    raise AssertionError('探测阶段未在限定回合内结束')
+
+
 def llm_reply(memory,**fields):
     return json.dumps({'request_id':memory.pending_llm['request_id'],**fields},ensure_ascii=False)
 
@@ -47,22 +65,23 @@ class TaskTests(unittest.TestCase):
                 self.assertEqual(r['roleCommandMap']['4']['action'],'acceptTask')
                 self.assertFalse(r['executeCmd'])
                 p['roundNo']=2;p['phaseTask']=desc
-                r=decide_response(p,m)
+                n,r=advance_probes(p,m,2)
                 self.assertIn(desc,r['prompt'])
                 self.assertNotIn('4',r['roleCommandMap'])
                 self.assertEqual(m.llm_used,0)
-                p['roundNo']=3;p['llmResp']=llm_reply(m,kind='command',command=command,skill='复用输入解析与求解方法')
+                p['roundNo']=n+1;p['lastCmdResult']=''
+                p['llmResp']=llm_reply(m,kind='command',command=command,skill='复用输入解析与求解方法')
                 r=decide_response(p,m)
                 self.assertEqual(r['executeCmd'],command)
                 self.assertFalse(r['prompt'])
-                p['roundNo']=4;p['llmResp']='';p['lastCmdResult']=output
+                p['roundNo']=n+2;p['llmResp']='';p['lastCmdResult']=output
                 r=decide_response(p,m)
                 self.assertIn(output.split('\n')[-1],r['prompt'])
-                p['roundNo']=5;p['llmResp']=llm_reply(m,kind='answer',answer=answer)
+                p['roundNo']=n+3;p['llmResp']=llm_reply(m,kind='answer',answer=answer)
                 r=decide_response(p,m)
                 self.assertEqual(json.loads(r['roleCommandMap']['4']['taskAnswer']),answer)
                 self.assertFalse(r['prompt'])
-                p['roundNo']=6;p['phaseTask']='';p['llmResp']=''
+                p['roundNo']=n+4;p['phaseTask']='';p['llmResp']=''
                 p['teamOur']['playerTasks'][0]['isValid']=False
                 decide_response(p,m)
                 self.assertEqual(len(m.skills),1)
@@ -70,8 +89,10 @@ class TaskTests(unittest.TestCase):
 
     def test_task_calls_unlimited_without_consuming_daily_quota(self):
         p=task_fixture();p['phaseTask']='任意复杂任务';m=Memory(day=1,llm_used=3)
-        for n in range(1,7):
-            p['roundNo']=n;p['llmResp']='invalid'
+        n,r=advance_probes(p,m,1)
+        self.assertTrue(r['prompt'])
+        for k in range(1,5):
+            p['roundNo']=n+k;p['llmResp']='invalid'
             response=decide_response(p,m)
             self.assertTrue(response['prompt'])
             self.assertEqual(m.llm_used,3)
@@ -97,18 +118,21 @@ class TaskTests(unittest.TestCase):
     def test_wrong_request_id_cannot_execute_command(self):
         p=task_fixture();p['phaseTask']='读取文件';m=Memory()
         decide_response(p,m)
-        p['roundNo']=2;p['llmResp']=json.dumps({'request_id':'old','kind':'command','command':'bad'})
+        n,_=advance_probes(p,m,2)
+        p['roundNo']=n+1;p['llmResp']=json.dumps({'request_id':'old','kind':'command','command':'bad'})
         r=decide_response(p,m)
-        self.assertFalse(r['executeCmd']);self.assertTrue(r['prompt'])
+        self.assertNotEqual(r['executeCmd'],'bad')
+        self.assertTrue(r['prompt'])
 
     def test_partial_answer_feedback_does_not_create_skill(self):
         p=task_fixture();p['phaseTask']='多字段任务';m=Memory();decide_response(p,m)
-        p['roundNo']=2;p['llmResp']=llm_reply(m,kind='answer',answer={'a':1})
+        n,_=advance_probes(p,m,2)
+        p['roundNo']=n+1;p['llmResp']=llm_reply(m,kind='answer',answer={'a':1})
         decide_response(p,m)
-        p['roundNo']=3;p['llmResp']='';p['errors']=[{'errorCode':2,'description':'b字段缺失'}]
+        p['roundNo']=n+2;p['llmResp']='';p['errors']=[{'errorCode':2,'description':'b字段缺失'}]
         r=decide_response(p,m)
         self.assertIn('b字段缺失',r['prompt']);self.assertFalse(m.skills)
-        p['roundNo']=4;p['phaseTask']='';p['errors']=[{'errorCode':1}]
+        p['roundNo']=n+3;p['phaseTask']='';p['errors']=[{'errorCode':1}]
         decide_response(p,m);self.assertFalse(m.skills)
 
     def test_cannot_accept_enemy_or_cooling_point(self):
@@ -126,12 +150,12 @@ class TaskTests(unittest.TestCase):
 
     def test_news_result_is_not_task_answer(self):
         p=task_fixture();p['worldNews']={'officialNews':'消息'};m=Memory()
-        decide_response(p,m)
+        decide_response(p,m)                        # 第1轮: 新闻 prompt(其 request_id 属于新闻通道)
         reply=llm_reply(m,kind='answer',answer='NOT A TASK ANSWER',blocked_mines=[])
         p['roundNo']=2;p['phaseTask']='新任务';p['llmResp']=reply
-        r=decide_response(p,m)
+        r=decide_response(p,m)                      # 新闻回复到达时任务已开始
         self.assertNotIn('submitAnswer',[x['action'] for x in r['roleCommandMap'].values()])
-        self.assertTrue(r['prompt'])
+        self.assertTrue(r['prompt'] or r['executeCmd'])
 
     def test_treasure_validated_items_and_single_attempt(self):
         p=task_fixture();p['teamOur']['playerTasks']=[]
