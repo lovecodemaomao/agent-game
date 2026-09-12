@@ -10,7 +10,10 @@ RETURN_MARGIN=5                           # 与 brain.RETURN_MARGIN 保持一致
 HARVEST_BUFFER=2                          # 顺手采集只留 2 回合缓冲（返程已在 margin 内）
 NEAR_HOME_RADIUS=4                        # "家附近"判定半径（基地切比雪夫距离）
 HARVEST_DETOUR=2                          # 顺路判据: 多绕不超过 2 回合即视为顺手
-NIGHT_OVERRUN=12                          # 首日召唤令专差允许延伸入夜的回合数
+NIGHT_OVERRUN=12                          # 保留: 长差事允许的入夜余量
+WALL_FIXER_RESERVE=3                      # issue #3: 常备修复包数量(建议 2-3)
+WALL_FIXER_BUDGET_KEEP=20                 # 无武器升级需求时, 买修复包只保留的金币
+WEAPON_VOUCHER_KEEP=100                   # 仍有武器待升2级时, 为其保留的券价
 HP={'station':(1500,3000,4500),'wall':(1000,1500,2000),
     'rocket':(1000,1500,2000),'railgun':(1000,1500,2000),'gatling':(1000,1500,2000)}
 
@@ -20,30 +23,41 @@ class Economy:
         self.p=p; self.turn=p.turn; self.m=p.memory
         self.mine_claims=Counter()
 
-    def options(self):
-        """升级/修复候选，按天数调整优先级（需求3）:
+    def wall_phase_active(self):
+        """迎敌半圈围墙是否仍处于"补到2级"的阶段（未达半数即为是）。"""
+        walls=self.turn.walls()
+        if not walls: return False
+        done=sum(1 for w in walls if max(1,min(3,w.level))>=2)
+        return done < max(1,len(walls)//2)
 
-        - 第1天: 武器升级优先（尽量当天把武器升上去）
-        - 第2天起: 先把围墙升到 2 级（迎敌半圈），随后若还有余量时间与金钱，
-          再回头升武器；围墙 2->3 级排在武器之后
-        - 与天数无关的保命项始终最优先: 濒危基地(<60%血)、三级残血墙的 WallFixer
+    def options(self):
+        """升级/修复候选，优先级（issue #3）:
+
+        - 保命项永远最优先: 濒危基地(<60%血)、**任意等级围墙血量<50% 的 WallFixer 修复**
+          （面向机器人的前排墙优先）
+        - 前期(day<=2): 武器升 2 级优先 -> 围墙升 2 级 -> 武器升 3 级 -> 围墙升 3 级
+        - 第3天起: 迎敌半圈围墙升到 2 级（≥半数达成前）优先，随后武器接管
         """
         options=[]
         # 天数兜底: memory.day 未初始化时按回合号推导，保证优先级判断稳定
         day=self.m.day or ((self.turn.round_no-1)//130+1)
-        weapon_first=day<=1
+        weapon_first=day<=2          # issue #3: 前期(day1-2)优先武器升级
         # 围墙阶段: 迎敌半圈的主要墙体（≥一半）升到2级前，围墙券优先于武器券；
         # 达标后武器升级接管（需求3: 围墙升级成功后若还有余量，再执行武器升级）。
         # 若不设这个"阶段完成"判据，10 座墙的券会一直插队，武器永远升不上去。
-        all_walls=self.turn.walls()
-        wall_done=sum(1 for w in all_walls if max(1,min(3,w.level))>=2)
-        wall_phase=bool(all_walls) and wall_done < max(1,len(all_walls)//2)
+        wall_phase=self.wall_phase_active()
         for u in (*self.turn.weapons(), *self.turn.walls(), self.turn.station()):
             if u is None: continue
             level=max(1,min(3,u.level)); ratio=u.health/HP[u.kind][level-1]
-            if u.kind=='wall' and level==3:
+            held_fixer=any('WallFixer' in r.backpack for r in self.turn.controllable())
+            if u.kind=='wall' and ratio<0.5 and (level>=3 or held_fixer):
+                # issue #3: 围墙血量<50% 且手上有 WallFixer（或已满级无法用升级券回血）
+                # -> 立即修复，最高优先级；面向机器人的前排墙优先。
+                # 低等级墙且无修复包时不走这里: 升级券升级同样回满血且更划算。
+                item='WallFixer'; priority=0
+            elif u.kind=='wall' and level==3:
                 if ratio>=0.7: continue
-                item='WallFixer'; priority=0 if ratio<0.35 else 4
+                item='WallFixer'; priority=4
             elif u.kind=='station' and ratio<0.6 and level<3:
                 item=f'StationUpgradeVoucher{level}'; priority=0
             else:
@@ -51,13 +65,13 @@ class Economy:
                 prefix='Station' if u.kind=='station' else 'Wall' if u.kind=='wall' else 'Weapon'
                 item=f'{prefix}UpgradeVoucher{level}'
                 if u.kind=='wall':
-                    # 围墙1->2级: 第1天让位武器; 第2天起在围墙阶段优先, 阶段完成后让位武器
-                    priority = (2 if level==1 else 2.5) if weapon_first else \
+                    # 前期让位武器升2级; 第3天起围墙阶段(升2级)优先, 完成后让位武器
+                    priority = (2 if level==1 else 3) if weapon_first else \
                                (1 if (level==1 and wall_phase) else 3)
                 elif u.kind=='rocket':
-                    priority=1 if weapon_first else (3 if wall_phase else 1)
+                    priority=(1 if level==1 else 3) if weapon_first else (3 if wall_phase else 1)
                 else:                      # railgun / gatling
-                    priority=1.5 if weapon_first else (3.5 if wall_phase else 1.5)
+                    priority=(1.5 if level==1 else 3.5) if weapon_first else (3.5 if wall_phase else 1.5)
             # 围墙: 越朝向机器人越优先（self.p.walls 已按迎敌方向由前到后排序），
             # 非迎敌半圈的墙排到最后；受损墙再略微提前（ratio 越小越靠前）。
             if u.kind=='wall':
@@ -97,21 +111,43 @@ class Economy:
                     occupied.add(uid)
                     break
         if not self.turn.is_day or len(self.turn.weapons())<3: return
-        # 需求2: 第一天在买升级券之前，只要金钱超过100 就优先买大机器人召唤令
-        if (self.m.day<=1 and not self.m.summon_order_done
+        # issue #3 的修复包储备见下方（排在升级券采购之后）
+        # issue #3: 常备 WALL_FIXER_RESERVE 个修复包。
+        # 顺序很关键: 排在升级券采购之前, 否则 20 金的围墙券会一直插队、
+        # 储备永远买不到; 同时为"待升2级的武器"保留券价, 不抢武器升级预算。
+        # 只有确实建了围墙才需要修墙包。
+        needs_weapon_voucher=any(max(1,min(3,w.level))<2 for w in self.turn.weapons())
+        if (self.turn.walls()
+                and not any(j.get('type') in ('upgrade','order') for j in self.m.jobs.values())):
+            stock=sum(r.backpack.count('WallFixer') for r in self.turn.workers())
+            price=self.p.shop_prices.get('WallFixer')
+            keep=WEAPON_VOUCHER_KEEP if needs_weapon_voucher else WALL_FIXER_BUDGET_KEEP
+            if (price is not None and stock<WALL_FIXER_RESERVE
+                    and self.p.gold>=price+keep):
+                courier=self._courier_for(price,skip_item='WallFixer')
+                if courier:
+                    role,shop=courier
+                    self.m.jobs[role.unit_id]={'type':'order','item':'WallFixer',
+                        'price':price,'shop':shop,'keep':True}
+                    self.m.event(f'worker {role.unit_id}: reserve WallFixer ({stock+1}/{WALL_FIXER_RESERVE})')
+                    return
+        # issue #3: 取消"首日金钱>100 优先买大机器人召唤令"的逻辑。
+        # 前期金币优先用于武器升级 / 围墙升级 / 储备修复包；
+        # 只有在武器升到2级以上、迎敌半圈围墙阶段完成、且进入第3天之后，
+        # 才把富余金币用于机器人召唤令骚扰。
+        if (self.m.day>=3 and not self.m.summon_order_done
+                and all(max(1,min(3,w.level))>=2 for w in self.turn.weapons())
+                and not self.wall_phase_active()
                 and SUMMON_ORDER in self.p.shop_prices
                 and self.p.gold>SUMMON_ORDER_TRIGGER
                 and not any(j.get('type')=='order' for j in self.m.jobs.values())
                 and not any(SUMMON_ORDER in r.backpack for r in self.turn.controllable())):
-            # 首日破百通常在白昼后段, 商店往返来不及但值得为 100 金骚扰道具
-            # 延伸入夜（首夜仅少量小型机器人, 且召唤令买到即用、无需带回）
-            courier=self._courier_for(self.p.shop_prices[SUMMON_ORDER],
-                                      extra_slack=NIGHT_OVERRUN)
+            courier=self._courier_for(self.p.shop_prices[SUMMON_ORDER])
             if courier:
                 role,shop=courier
                 self.m.jobs[role.unit_id]={'type':'order','item':SUMMON_ORDER,
                     'price':self.p.shop_prices[SUMMON_ORDER],'shop':shop}
-                self.m.event(f'worker {role.unit_id}: day-1 priority buy {SUMMON_ORDER}')
+                self.m.event(f'worker {role.unit_id}: buy {SUMMON_ORDER} after weapons/defense secured')
                 return
         # One purchasing courier at a time; the other worker keeps producing money.
         if any(j.get('type') in ('upgrade','order') for j in self.m.jobs.values()): return
@@ -143,7 +179,7 @@ class Economy:
                 self.m.event(f'worker {role.unit_id}: purchase {item} for building {uid}')
                 return
 
-    def _courier_for(self,price,extra_slack=0):
+    def _courier_for(self,price,extra_slack=0,skip_item=None):
         """挑一名能负担"去商店->再回防"整段时间的工人做采购。
 
         extra_slack: 允许的额外回合余量（首日召唤令专差可延伸入夜, 见 NIGHT_OVERRUN）。
@@ -152,6 +188,7 @@ class Economy:
         best=None
         for role in self.turn.workers():
             if role.backpack_full: continue
+            if skip_item and skip_item in role.backpack: continue   # 别派给已持有该物品的人
             routes=self.p.route(role)
             for shop in shops:
                 stand=routes.adjacent(shop)
@@ -167,8 +204,11 @@ class Economy:
         if not job or job.get('type')!='order': return False
         item=job['item']
         if item in role.backpack:
-            self.p.commands[str(role.unit_id)]={'action':'use','name':item}
             self.m.jobs.pop(role.unit_id,None)
+            if job.get('keep'):
+                self.m.event(f'worker {role.unit_id}: WallFixer stocked')
+                return True          # 储备件: 留待修墙时使用
+            self.p.commands[str(role.unit_id)]={'action':'use','name':item}
             self.m.summon_order_done=True
             self.m.event(f'worker {role.unit_id}: use {item}')
             return True

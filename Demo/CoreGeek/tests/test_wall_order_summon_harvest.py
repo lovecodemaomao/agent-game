@@ -67,31 +67,46 @@ class WallFacingOrderTests(unittest.TestCase):
 
 
 class SummonOrderTests(unittest.TestCase):
-    def test_day1_priority_buy_when_gold_above_100(self):
-        p = base_payload(day=1, gold=120)
-        p['roundNo'] = 40            # 白昼后段: 往返商店来不及, 靠入夜余量仍可派出
+    def test_no_summon_order_on_day1_even_with_rich_gold(self):
+        # issue #3: 取消"首日金钱>100 优先买大机器人召唤令"的逻辑
+        p = base_payload(day=1, gold=300)
+        p['roundNo'] = 40
         m = Memory(day=1)
         planner = Planner(Turn.load(p), p, m)
         planner.economic.prepare()
-        orders = [j for j in m.jobs.values() if j.get('type') == 'order']
-        self.assertTrue(orders, m.jobs)
-        self.assertEqual(orders[0]['item'], SUMMON_ORDER)
-        # 不应同时安排升级券采购
-        self.assertFalse([j for j in m.jobs.values() if j.get('type') == 'upgrade'], m.jobs)
+        summons = [j for j in m.jobs.values() if j.get('item') == SUMMON_ORDER]
+        self.assertFalse(summons, m.jobs)
 
-    def test_no_order_when_gold_not_above_trigger(self):
-        p = base_payload(day=1, gold=SUMMON_ORDER_TRIGGER)
-        m = Memory(day=1)
+    def test_summon_order_only_after_weapons_and_walls_secured(self):
+        # 武器未满2级时: 不买召唤令
+        p = base_payload(day=3, gold=300)
+        m = Memory(day=3)
         planner = Planner(Turn.load(p), p, m)
         planner.economic.prepare()
-        self.assertFalse([j for j in m.jobs.values() if j.get('type') == 'order'], m.jobs)
+        self.assertFalse([j for j in m.jobs.values() if j.get('item') == SUMMON_ORDER], m.jobs)
+        # 武器全 2 级 + 围墙阶段完成 -> 才允许采购
+        sites = wall_sites(Turn.load(p))
+        roles = [u for u in p['teamOur']['roles'] if u['roleType'] in ('rocket', 'railgun')]
+        for u in roles:
+            u['level'] = 2
+        p['teamOur']['roles'] += [unit(40 + i, 'wall', q.x, q.y, health=1000, level=2)
+                                  for i, q in enumerate(sites)]
+        m2 = Memory(day=3)
+        planner2 = Planner(Turn.load(p), p, m2)
+        planner2.economic.prepare()
+        self.assertTrue([j for j in m2.jobs.values() if j.get('item') == SUMMON_ORDER]
+                        or any(j.get('item', '').startswith('Wall') for j in m2.jobs.values()),
+                        m2.jobs)
 
-    def test_no_order_after_day1(self):
-        p = base_payload(day=2, gold=300)
-        m = Memory(day=2)
+    def test_no_summon_order_when_gold_below_trigger(self):
+        p = base_payload(day=3, gold=SUMMON_ORDER_TRIGGER)
+        for u in p['teamOur']['roles']:
+            if u['roleType'] in ('rocket', 'railgun'):
+                u['level'] = 2
+        m = Memory(day=3)
         planner = Planner(Turn.load(p), p, m)
         planner.economic.prepare()
-        self.assertFalse([j for j in m.jobs.values() if j.get('type') == 'order'], m.jobs)
+        self.assertFalse([j for j in m.jobs.values() if j.get('item') == SUMMON_ORDER], m.jobs)
 
     def test_courier_buys_then_uses_order(self):
         p = base_payload(day=1, gold=120)

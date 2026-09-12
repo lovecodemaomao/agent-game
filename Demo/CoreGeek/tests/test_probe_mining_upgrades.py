@@ -154,7 +154,7 @@ class MiningRoleTests(unittest.TestCase):
 class UpgradeOrderTests(unittest.TestCase):
     def planned(self, day):
         p = two_worker_payload(day=day, gold=400)
-        p['teamOur']['roles'] += [unit(30, 'wall', 13, 24)]
+        p['teamOur']['roles'] += [unit(30, 'wall', 13, 24, health=1000)]
         m = Memory(day=day)
         planner = Planner(Turn.load(p), p, m)
         return planner, planner.economic.options()
@@ -167,19 +167,26 @@ class UpgradeOrderTests(unittest.TestCase):
         wall_pos = next(i for i, o in enumerate(options) if o[3].startswith('Wall'))
         self.assertLess(weapon_pos, wall_pos)
 
-    def test_day2_wall_phase_first_then_weapons(self):
+    def test_day2_weapons_first_per_issue3(self):
+        # issue #3: 前期(day1-2) 金币优先武器升级，围墙券在其后
         planner, options = self.planned(day=2)
-        walls = [o for o in options if o[3].startswith('Wall')]
-        self.assertTrue(walls, '存在待升级围墙')
+        self.assertTrue([o for o in options if o[3].startswith('Wall')], '存在待升级围墙')
+        weapon_pos = next(i for i, o in enumerate(options) if o[3].startswith('Weapon'))
+        wall_pos = next(i for i, o in enumerate(options) if o[3].startswith('Wall'))
+        self.assertLess(weapon_pos, wall_pos, [o[3] for o in options])
+
+    def test_day3_onwards_wall_phase_first(self):
+        planner, options = self.planned(day=3)
         wall_pos = next(i for i, o in enumerate(options) if o[3].startswith('Wall'))
         weapon_pos = next(i for i, o in enumerate(options) if o[3].startswith('Weapon'))
         self.assertLess(wall_pos, weapon_pos, [o[3] for o in options])
 
     def test_day2_weapons_resume_after_wall_phase_done(self):
         # 主要围墙已升到2级后 -> 武器升级接管
-        p = two_worker_payload(day=2, gold=400)
+        p = two_worker_payload(day=3, gold=400)
         sites = wall_sites(Turn.load(p))
-        p['teamOur']['roles'] += [unit(40 + i, 'wall', q.x, q.y, level=(2 if i < len(sites) - 1 else 1))
+        p['teamOur']['roles'] += [unit(40 + i, 'wall', q.x, q.y, health=1000,
+                                       level=(2 if i < len(sites) - 1 else 1))
                                   for i, q in enumerate(sites)]
         m = Memory(day=2)
         planner = Planner(Turn.load(p), p, m)

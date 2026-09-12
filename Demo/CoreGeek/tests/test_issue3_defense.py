@@ -1,0 +1,189 @@
+"""issue #3 的回归测试：前期武器优先、围墙 <50% 立即修复、常备 2-3 个 WallFixer。
+
+issue 要点:
+  1. 取消"首日金钱>100 优先买大机器人召唤令"，前期金币优先武器升级;
+  2. 每回合检测围墙血量，<50% 且背包有 WallFixer 立即使用修复（面向机器人的前排优先）;
+  3. 常备 2-3 个 WallFixer。
+"""
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[0]))
+from test_strategy import fixture, unit
+from agent.brain import Planner, decide_response, wall_sites
+from agent.memory import Memory
+from agent.protocol import Turn, Pos, distance
+from agent.economy import SUMMON_ORDER, WALL_FIXER_RESERVE
+
+
+def payload(day=1, gold=75, walls=None, zones=None, hour=0):
+    p = fixture()
+    p['roundNo'] = (day - 1) * 130 + 1 + hour
+    p['teamOur']['goldNum'] = gold
+    p['teamOur']['roles'] = [
+        unit(1, 'station', 10, 24, health=1500),
+        unit(2, 'worker', 9, 24),
+        unit(3, 'worker', 12, 24),
+        unit(10, 'rocket', 9, 23), unit(11, 'rocket', 10, 23), unit(12, 'railgun', 11, 25),
+    ] + list(walls or [])
+    p['mapInfo']['zones'] = zones if zones is not None else [
+        {'pos': {'x': 6, 'y': 24}, 'neutralType': 'stone'},
+        {'pos': {'x': 5, 'y': 24}, 'neutralType': 'vendor'},
+        {'pos': {'x': 7, 'y': 24}, 'neutralType': 'weaponShop'},
+    ]
+    p['weaponShopList'] = [{'name': n, 'price': v} for n, v in [
+        ('WeaponUpgradeVoucher1', 100), ('WeaponUpgradeVoucher2', 150),
+        ('WallUpgradeVoucher1', 20), ('WallUpgradeVoucher2', 30),
+        ('WallFixer', 10), (SUMMON_ORDER, 100)]]
+    return p
+
+
+class WallRepairTests(unittest.TestCase):
+    def test_repairs_any_level_wall_below_half_with_held_fixer(self):
+        sites = wall_sites(Turn.load(payload()))
+        front = sites[0]
+        p = payload(day=2, gold=200, walls=[
+            unit(40, 'wall', front.x, front.y, health=400)])      # 40% 血量, 1级
+        p['teamOur']['roles'][1]['backpack'] = ['WallFixer']
+        p['teamOur']['roles'][1]['pos'] = {'x': front.x, 'y': front.y - 1}
+        m = Memory(day=2)
+        planner = Planner(Turn.load(p), p, m)
+        role = [w for w in planner.turn.workers() if w.unit_id == 2][0]
+        planner.economic.prepare()
+        self.assertTrue(planner.economic.upgrade(role, planner.route(role)), m.jobs)
+        cmd = planner.commands['2']
+        self.assertEqual(cmd['action'], 'use')
+        self.assertEqual(cmd['name'], 'WallFixer')
+        self.assertEqual(Pos.load(cmd['targetPos'][0]), front)
+
+    def test_healthy_wall_is_not_repaired(self):
+        sites = wall_sites(Turn.load(payload()))
+        front = sites[0]
+        p = payload(day=2, gold=200, walls=[
+            unit(40, 'wall', front.x, front.y, health=900)])      # 90% 血量
+        p['teamOur']['roles'][1]['backpack'] = ['WallFixer']
+        p['teamOur']['roles'][1]['pos'] = {'x': front.x, 'y': front.y - 1}
+        m = Memory(day=2)
+        planner = Planner(Turn.load(p), p, m)
+        planner.economic.prepare()
+        self.assertNotIn('2', planner.commands)
+
+    def test_front_wall_repaired_before_side_wall(self):
+        sites = wall_sites(Turn.load(payload()))
+        front, side = sites[0], sites[-1]
+        p = payload(day=2, gold=200, walls=[
+            unit(40, 'wall', front.x, front.y, health=400),
+            unit(41, 'wall', side.x, side.y, health=400)])
+        p['teamOur']['roles'][1]['backpack'] = ['WallFixer']
+        p['teamOur']['roles'][1]['pos'] = {'x': front.x, 'y': front.y - 1}
+        m = Memory(day=2)
+        planner = Planner(Turn.load(p), p, m)
+        options = planner.economic.options()
+        fixers = [o for o in options if o[3] == 'WallFixer']
+        self.assertEqual(fixers[0][4].pos, front, '面向机器人的墙应先修')
+
+    def test_low_level_wall_without_fixer_still_upgrades(self):
+        # 无修复包时, 低等级受损墙用升级券（升级同时回满血）而不是买修复包
+        sites = wall_sites(Turn.load(payload()))
+        front = sites[0]
+        p = payload(day=2, gold=200, walls=[
+            unit(40, 'wall', front.x, front.y, health=400)])
+        m = Memory(day=2)
+        planner = Planner(Turn.load(p), p, m)
+        items = [o[3] for o in planner.economic.options()]
+        self.assertIn('WallUpgradeVoucher1', items)
+        self.assertNotIn('WallFixer', items)
+
+    def test_night_repairs_when_already_adjacent(self):
+        # 夜间: 已在墙边且持有修复包 -> 立即修复(该工人本回合不操炮)
+        sites = wall_sites(Turn.load(payload()))
+        front = sites[0]
+        p = payload(day=1, gold=0, walls=[
+            unit(40, 'wall', front.x, front.y, health=200)])      # 20% 血量
+        p['roundNo'] = 85                                            # 夜晚
+        p['teamOur']['roles'][1]['backpack'] = ['WallFixer']
+        p['teamOur']['roles'][1]['pos'] = {'x': front.x, 'y': front.y - 1}
+        m = Memory(day=1)
+        r = decide_response(p, m)
+        cmd = r['roleCommandMap'].get('2')
+        self.assertIsNotNone(cmd, r['roleCommandMap'])
+        self.assertEqual(cmd['action'], 'use')
+        self.assertEqual(cmd['name'], 'WallFixer')
+
+
+class FixerReserveTests(unittest.TestCase):
+    def maxed(self, gold):
+        """全部满级且已建墙 -> 此时应把余钱用于储备修复包。"""
+        sites = wall_sites(Turn.load(payload()))
+        p = payload(day=2, gold=gold, walls=[unit(40 + i, 'wall', q.x, q.y, health=1000)
+                                             for i, q in enumerate(sites[:3])])
+        for u in p['teamOur']['roles']:
+            if u['roleType'] in ('rocket', 'railgun', 'station'):
+                u['level'] = 3
+        return p
+
+    def test_reserves_up_to_three_fixers(self):
+        p = self.maxed(150)
+        m = Memory(day=2)
+        planner = Planner(Turn.load(p), p, m)
+        planner.economic.prepare()
+        jobs = [j for j in m.jobs.values() if j.get('item') == 'WallFixer']
+        self.assertTrue(jobs, m.jobs)
+        self.assertTrue(jobs[0].get('keep'), '储备件买到后应留存而非立即使用')
+
+    def test_stops_reserving_at_target(self):
+        p = self.maxed(150)
+        p['teamOur']['roles'][1]['backpack'] = ['WallFixer'] * WALL_FIXER_RESERVE
+        m = Memory(day=2)
+        planner = Planner(Turn.load(p), p, m)
+        planner.economic.prepare()
+        self.assertFalse([j for j in m.jobs.values() if j.get('item') == 'WallFixer'], m.jobs)
+
+    def test_reserve_fires_while_keeping_weapon_voucher_budget(self):
+        # 仍有武器待升2级: 金币须高于"券价+100"才动用储备
+        sites = wall_sites(Turn.load(payload()))
+        p = payload(day=2, gold=120, walls=[unit(40, 'wall', sites[0].x, sites[0].y, health=1000)])
+        # 120 >= 10+100 -> 可储备
+        m = Memory(day=2)
+        planner = Planner(Turn.load(p), p, m)
+        planner.economic.prepare()
+        self.assertTrue([j for j in m.jobs.values() if j.get('item') == 'WallFixer'], m.jobs)
+
+    def test_reserve_never_assigned_to_worker_already_holding_fixer(self):
+        # 回归: 曾把"补第2个修复包"派给已持有修复包的工人, 差事被立即弹掉
+        # 造成每回合空转、采购名额被占死(200+金币却买不到任何升级券)
+        sites = wall_sites(Turn.load(payload()))
+        p = payload(day=2, gold=200, walls=[unit(40, 'wall', sites[0].x, sites[0].y, health=1000)])
+        p['teamOur']['roles'][1]['backpack'] = ['WallFixer']      # worker 2 已持有
+        m = Memory(day=2)
+        planner = Planner(Turn.load(p), p, m)
+        planner.economic.prepare()
+        jobs = [j for j in m.jobs.values() if j.get('item') == 'WallFixer']
+        self.assertTrue(jobs, m.jobs)
+        holder = [uid for uid, j in m.jobs.items() if j.get('item') == 'WallFixer'][0]
+        self.assertNotEqual(holder, 2, '不应派给已持有修复包的工人')
+
+    def test_voucher_purchase_not_starved_by_reserve(self):
+        # 修复包已备齐(3个)后, 武器券采购必须能正常安排
+        sites = wall_sites(Turn.load(payload()))
+        p = payload(day=2, gold=200, walls=[unit(40, 'wall', sites[0].x, sites[0].y, health=1000)])
+        p['teamOur']['roles'][1]['backpack'] = ['WallFixer'] * WALL_FIXER_RESERVE
+        m = Memory(day=2)
+        planner = Planner(Turn.load(p), p, m)
+        planner.economic.prepare()
+        self.assertTrue([j for j in m.jobs.values() if j.get('type') == 'upgrade'], m.jobs)
+
+    def test_reserve_keeps_budget_for_weapon_voucher(self):
+        # 金币不足以同时保住武器券预算时不买修复包
+        p = payload(day=2, gold=60)
+        m = Memory(day=2)
+        planner = Planner(Turn.load(p), p, m)
+        planner.economic.prepare()
+        bought = [j for j in m.jobs.values() if j.get('item') == 'WallFixer']
+        self.assertFalse(bought, m.jobs)
+
+
+if __name__ == '__main__':
+    unittest.main()

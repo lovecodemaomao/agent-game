@@ -264,6 +264,12 @@ class Planner:
         return ready
 
     def night(self):
+        # issue #3: 夜间同样每回合检查围墙血量，低于50%且手上持有 WallFixer
+        # 立即修复（只做"已经在墙边"的即时修复，不为修墙长途走动而放弃操炮）。
+        self.economic.prepare()
+        for role in self.turn.workers():
+            if self.economic.upgrade(role, self.route(role)):
+                self.engaged.add(role.unit_id)
         ready = self.assign_towers()
         remaining = {r.robot_id: r.health for r in self.turn.robots if r.health > 0}
         for role, tower in sorted(ready, key=lambda pair: pair[1].kind != 'rocket'):
