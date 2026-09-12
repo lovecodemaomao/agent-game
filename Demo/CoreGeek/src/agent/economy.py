@@ -399,9 +399,21 @@ class Economy:
                 if job['item'].startswith('Wall'): self.m.day_wall_upgrades += 1
                 elif job['item'].startswith('Weapon'): self.m.day_weapon_upgrades += 1
                 return True
-            if self.turn.is_day and self.p.enough_time(role,routes,target.pos):
-                return self.p.interact(role,routes,target.pos,'use',name=job['item'],targetPos=[target.pos.dump()])
-            return False
+            if routes.distance(target.pos)>=INF:
+                # 目标不可达(被围死等): 放弃本次差事, 免得整夜绕路
+                self.m.jobs.pop(role.unit_id,None)
+                return False
+            if self.turn.is_day:
+                if self.p.enough_time(role,routes,target.pos):
+                    return self.p.interact(role,routes,target.pos,'use',
+                                           name=job['item'],targetPos=[target.pos.dump()])
+                return False
+            # 夜间: 必须先把手上的券用掉再去武器位（不允许揣着券过夜防御）。
+            # 走到目标旁即用, 用完下回合由 assign_towers 送回武器旁。
+            self.p.interact(role,routes,target.pos,'use',
+                            name=job['item'],targetPos=[target.pos.dump()])
+            self.m.event(f'worker {role.unit_id}: night delivery of {job["item"]}')
+            return True
         if not self.turn.is_day: return False
         if self.p.remaining<=self.p.home_cost(role,role.pos)+5:
             self.m.jobs.pop(role.unit_id,None)

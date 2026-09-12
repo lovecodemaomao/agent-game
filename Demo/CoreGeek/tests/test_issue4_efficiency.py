@@ -222,3 +222,73 @@ class TaskReuseTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NightVoucherDeliveryTests(unittest.TestCase):
+    """夜间必须先把背包里的升级券用掉, 再回武器塔旁防御。"""
+
+    def night_payload(self, gold=0, wall_health=1000, worker_pos=None, backpack=None):
+        sites = wall_sites(Turn.load(payload()))
+        p = payload(day=1, gold=gold,
+                    walls=[unit(40, 'wall', sites[0].x, sites[0].y, health=wall_health)])
+        p['roundNo'] = 85                      # 夜晚
+        p['teamOur']['roles'][1]['pos'] = worker_pos or {'x': 9, 'y': 22}
+        if backpack:
+            p['teamOur']['roles'][1]['backpack'] = list(backpack)
+        return p, sites[0]
+
+    def test_night_uses_voucher_when_already_adjacent(self):
+        # 工人贴着受损/待升级的墙 -> 夜里直接使用券
+        sites = wall_sites(Turn.load(payload()))
+        p = payload(day=1, gold=0, walls=[unit(40, 'wall', sites[0].x, sites[0].y, health=1000)])
+        p['roundNo'] = 85
+        p['teamOur']['roles'][1]['pos'] = {'x': sites[0].x, 'y': sites[0].y - 1}
+        p['teamOur']['roles'][1]['backpack'] = ['WallUpgradeVoucher1']
+        m = Memory(day=1)
+        planner = Planner(Turn.load(p), p, m)
+        planner.run()
+        cmd = planner.commands.get('2')
+        self.assertIsNotNone(cmd, planner.commands)
+        self.assertEqual(cmd['action'], 'use')
+        self.assertEqual(cmd['name'], 'WallUpgradeVoucher1')
+
+    def test_night_moves_toward_target_when_carrying_voucher(self):
+        # 拿着券但不在墙边 -> 夜里也要朝墙走过去用掉(而不是直接去武器位)
+        sites = wall_sites(Turn.load(payload()))
+        p = payload(day=1, gold=0, walls=[unit(40, 'wall', sites[0].x, sites[0].y, health=1000)])
+        p['roundNo'] = 85
+        p['teamOur']['roles'][1]['pos'] = {'x': 9, 'y': 21}     # 距墙若干格
+        p['teamOur']['roles'][1]['backpack'] = ['WallUpgradeVoucher1']
+        m = Memory(day=1)
+        planner = Planner(Turn.load(p), p, m)
+        planner.run()
+        cmd = planner.commands.get('2')
+        self.assertIsNotNone(cmd, planner.commands)
+        self.assertEqual(cmd['action'], 'move', cmd)
+        # 目标应是朝该墙方向的格子(比当前位置更靠近墙)
+        tgt = Pos.load(cmd['targetPos'][0])
+        self.assertLess(distance(tgt, sites[0]), distance(Pos(9, 21), sites[0]))
+
+    def test_night_weapon_voucher_also_delivered(self):
+        p = payload(day=1, gold=0)
+        p['roundNo'] = 85
+        p['teamOur']['roles'][1]['pos'] = {'x': 10, 'y': 24}    # 基地旁
+        p['teamOur']['roles'][1]['backpack'] = ['WeaponUpgradeVoucher1']
+        m = Memory(day=1)
+        planner = Planner(Turn.load(p), p, m)
+        planner.run()
+        cmd = planner.commands.get('2')
+        self.assertIsNotNone(cmd, planner.commands)
+        self.assertIn(cmd['action'], ('move', 'use'))
+
+    def test_no_buying_at_night(self):
+        # 夜里不跑商店采购(采购是白天的事), 避免夜间离岗
+        sites = wall_sites(Turn.load(payload()))
+        p = payload(day=1, gold=200, walls=[unit(40, 'wall', sites[0].x, sites[0].y, health=1000)])
+        p['roundNo'] = 85
+        p['teamOur']['roles'][1]['pos'] = {'x': 9, 'y': 22}
+        m = Memory(day=1)
+        planner = Planner(Turn.load(p), p, m)
+        planner.run()
+        cmd = planner.commands.get('2')
+        self.assertNotEqual((cmd or {}).get('action'), 'buy', cmd)
