@@ -15,6 +15,7 @@ from .protocol import Pos, Turn, distance, station_footprint, move_command
 LOADOUT = ("rocket", "rocket", "railgun")
 RETURN_MARGIN = 2          # 回到武器旁的少量安全余量
 RETURN_DEADLINE = 75       # 当天第75回合(含入夜前5回合)前必须回到武器塔旁; 夜间允许移动
+INNER_STAND_SLACK = 8      # 夜间交互站位: 为走到"靠基地内侧"最多多走的步数
 
 
 def ring(turn, radius):
@@ -100,8 +101,43 @@ class Planner:
         self.reserved.add(step)
         return True
 
+    def inner_stand(self, routes, target, action):
+        """夜间交互站位: 只返回严格"靠基地一侧"的相邻格(代价允许时), 否则 None。
+
+        站在围墙外侧会暴露在机器人攻击范围内, 因此夜间对建筑使用券/修复包,
+        要走到内侧再动手; 内侧不可达(代价超出允许步数)时返回 None, 由调用方
+        退回最短路站位, 保证不会来回打转。
+        """
+        if self.turn.is_day or action not in ('use', 'build'):
+            return None
+        station = self.turn.station()
+        if station is None:
+            return None
+        target_d = distance(target, station.pos)
+        cands = [q for q in neighbours(target)
+                 if q in routes.cost and distance(q, station.pos) < target_d]
+        if not cands:
+            return None
+        best = min(routes.cost[q] for q in cands)
+        near = [q for q in cands if routes.cost[q] <= best + INNER_STAND_SLACK]
+        if not near:
+            return None
+        return min(near, key=lambda q: (distance(q, station.pos), routes.cost[q], q.x, q.y))
+
     def interact(self, role, routes, target, action, **fields):
-        stand = routes.adjacent(target)
+        """与目标交互: 白天走最短路; 夜间优先走到靠基地的内侧再动作。"""
+        stand = None
+        station = self.turn.station()
+        inner = self.inner_stand(routes, target, action)
+        if inner is not None and station is not None:
+            # 已经贴着目标且不比该内侧格更外侧 -> 就地动作(不为挪一格白费回合)
+            if routes.distance(target) == 0 and \
+                    distance(role.pos, station.pos) <= distance(inner, station.pos):
+                stand = role.pos
+            else:
+                stand = inner
+        if stand is None:
+            stand = routes.adjacent(target)
         if stand is None:
             return False
         if stand == role.pos:

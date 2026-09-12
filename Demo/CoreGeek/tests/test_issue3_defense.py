@@ -104,7 +104,12 @@ class WallRepairTests(unittest.TestCase):
             unit(40, 'wall', front.x, front.y, health=200)])      # 20% 血量
         p['roundNo'] = 85                                            # 夜晚
         p['teamOur']['roles'][1]['backpack'] = ['WallFixer']
-        p['teamOur']['roles'][1]['pos'] = {'x': front.x, 'y': front.y - 1}
+        # 夜间必须站在靠基地的内侧(外侧会被机器人打)
+        station = Pos(10, 24)
+        inner = min((Pos(front.x + dx, front.y + dy)
+                     for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy),
+                    key=lambda q: distance(q, station))
+        p['teamOur']['roles'][1]['pos'] = inner.dump()
         m = Memory(day=1)
         r = decide_response(p, m)
         cmd = r['roleCommandMap'].get('2')

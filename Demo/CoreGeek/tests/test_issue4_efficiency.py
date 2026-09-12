@@ -237,12 +237,18 @@ class NightVoucherDeliveryTests(unittest.TestCase):
             p['teamOur']['roles'][1]['backpack'] = list(backpack)
         return p, sites[0]
 
-    def test_night_uses_voucher_when_already_adjacent(self):
-        # 工人贴着受损/待升级的墙 -> 夜里直接使用券
+    def inner_cell(self, wall, station=Pos(10, 24)):
+        return min((Pos(wall.x + dx, wall.y + dy)
+                    for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy),
+                   key=lambda q: distance(q, station))
+
+    def test_night_uses_voucher_when_already_on_inner_side(self):
+        # 已站在靠基地的内侧 -> 夜里直接使用券
         sites = wall_sites(Turn.load(payload()))
-        p = payload(day=1, gold=0, walls=[unit(40, 'wall', sites[0].x, sites[0].y, health=1000)])
+        wall = sites[0]
+        p = payload(day=1, gold=0, walls=[unit(40, 'wall', wall.x, wall.y, health=1000)])
         p['roundNo'] = 85
-        p['teamOur']['roles'][1]['pos'] = {'x': sites[0].x, 'y': sites[0].y - 1}
+        p['teamOur']['roles'][1]['pos'] = self.inner_cell(wall).dump()
         p['teamOur']['roles'][1]['backpack'] = ['WallUpgradeVoucher1']
         m = Memory(day=1)
         planner = Planner(Turn.load(p), p, m)
@@ -251,6 +257,27 @@ class NightVoucherDeliveryTests(unittest.TestCase):
         self.assertIsNotNone(cmd, planner.commands)
         self.assertEqual(cmd['action'], 'use')
         self.assertEqual(cmd['name'], 'WallUpgradeVoucher1')
+
+    def test_night_moves_to_inner_side_when_adjacent_outside(self):
+        # 贴着墙但在外侧 -> 先绕到内侧再用(外侧会被机器人打)
+        sites = wall_sites(Turn.load(payload()))
+        wall = sites[0]
+        station = Pos(10, 24)
+        outside = max((Pos(wall.x + dx, wall.y + dy)
+                       for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy),
+                      key=lambda q: distance(q, station))
+        p = payload(day=1, gold=0, walls=[unit(40, 'wall', wall.x, wall.y, health=1000)])
+        p['roundNo'] = 85
+        p['teamOur']['roles'][1]['pos'] = outside.dump()
+        p['teamOur']['roles'][1]['backpack'] = ['WallUpgradeVoucher1']
+        m = Memory(day=1)
+        planner = Planner(Turn.load(p), p, m)
+        planner.run()
+        cmd = planner.commands.get('2')
+        self.assertEqual(cmd['action'], 'move', cmd)
+        tgt = Pos.load(cmd['targetPos'][0])
+        self.assertLess(distance(tgt, station), distance(outside, station),
+                        '应走向更靠基地的一侧')
 
     def test_night_moves_toward_target_when_carrying_voucher(self):
         # 拿着券但不在墙边 -> 夜里也要朝墙走过去用掉(而不是直接去武器位)
@@ -292,3 +319,130 @@ class NightVoucherDeliveryTests(unittest.TestCase):
         planner.run()
         cmd = planner.commands.get('2')
         self.assertNotEqual((cmd or {}).get('action'), 'buy', cmd)
+
+
+class AutoTaskPipelineTests(unittest.TestCase):
+    """自动文件定位 -> API 自动调度 -> 作答 -> 记录技能事实 的全链路。"""
+
+    def task_payload(self, desc, task_type='自进化类1'):
+        p = fixture()
+        p['teamOur']['roles'] = [p['teamOur']['roles'][0], unit(4, 'pioneer', 12, 25)]
+        p['mapInfo']['zones'] = [{'pos': {'x': 13, 'y': 26}, 'neutralType': 'challengerTaskPoint1'}]
+        p['teamOur']['playerTasks'] = [{'taskPosition': {'x': 13, 'y': 26}, 'isValid': True,
+            'coldDownRounds': 0, 'timeoutRounds': 100, 'scoreReward': 50, 'goldReward': 30,
+            'taskType': task_type}]
+        p['phaseTask'] = desc
+        return p
+
+    def test_pipeline_locate_then_api_call_then_submit(self):
+        from agent.tasks import task_facts, mentioned_files
+        desc = '【自进化任务】读取 task_1_beijing.md 中的说明, 调用其接口给出答案'
+        p = self.task_payload(desc)
+        m = Memory()
+        # 第1轮: 自动定位(命令里应包含所提文件名)
+        planner = Planner(Turn.load(p), p, m)
+        Tasks(planner).run()
+        self.assertIn('task_1_beijing.md', planner.execute_cmd)
+        # 第2轮: API 自动调度(带 __API 标记)
+        p['roundNo'] = 2
+        p['lastCmdResult'] = ('[exitCode:0]\n__FILE /tmp/selfEvolutionTask/task_1_beijing.md\n'
+                              '__API_EXTRACT urls=[http://localhost:8899] hdr=(X-API-Key=heritage-api-key-2024) '
+                              'params=[id]\n__API status=200 base=http://localhost:8899\n'
+                              '__API_DIST id(15 distinct)\n'
+                              '__API_CALL http://localhost:8899?id=3 -> {"answer":"青色石板"}')
+        planner2 = Planner(Turn.load(p), p, m)
+        Tasks(planner2).run()
+        self.assertIn('__API', planner2.execute_cmd)
+        # 事实入库: kind=api + base/header/params
+        facts = task_facts(m.task['history'])
+        self.assertEqual(facts['kind'], 'api')
+        self.assertEqual(facts['base'], 'http://localhost:8899')
+        self.assertIn('id', facts['params'])
+        self.assertEqual(facts['distinct_values'], 15)
+
+    def test_next_same_kind_task_skips_location_round(self):
+        # 已有 API 技能事实 -> 新任务(换参数)直接构造调用, 不再跑定位轮
+        m = Memory()
+        m.skills.append({'task': '读取 task_1_beijing.md 并调用接口作答',
+                         'command': 'curl -s "http://localhost:8899?id=3"',
+                         'answer': '北京: 青色石板', 'param': 'beijing',
+                         'kind': 'api',
+                         'facts': {'kind': 'api', 'base': 'http://localhost:8899',
+                                   'header': "X-API-Key='heritage-api-key-2024'", 'params': ['id'],
+                                   'distinct_values': 15},
+                         'method': 'api', 'steps': []})
+        p = self.task_payload('读取 task_2_shanghai.md 并调用接口作答')
+        planner = Planner(Turn.load(p), p, m)
+        Tasks(planner).run()
+        cmd = planner.execute_cmd
+        self.assertIn('curl', cmd, cmd)
+        self.assertIn('http://localhost:8899', cmd)
+        self.assertIn('X-API-Key', cmd)
+        self.assertIn('shanghai', cmd, '应替换为新参数')
+        self.assertNotIn('__FILE', cmd, '跳过定位轮, 不应重新探测文件')
+
+    def test_facts_kind_file_for_file_only_task(self):
+        from agent.tasks import task_facts
+        history = [{'result': '[exitCode:0]\n__FILE /tmp/selfEvolutionTask/task_9.md\n内容...'}]
+        facts = task_facts(history)
+        self.assertEqual(facts['kind'], 'file')
+        self.assertEqual(facts['file'], '/tmp/selfEvolutionTask/task_9.md')
+
+
+class InnerStandTests(unittest.TestCase):
+    """夜间对建筑使用券/修复包时, 必须站在靠基地的内侧, 不能站围墙外侧。"""
+
+    def setup_night(self, worker_pos):
+        sites = wall_sites(Turn.load(payload()))
+        wall = sites[0]                      # 迎敌弧线最前排的墙
+        p = payload(day=1, gold=0, walls=[unit(40, 'wall', wall.x, wall.y, health=1000)])
+        p['roundNo'] = 85                    # 夜晚
+        p['teamOur']['roles'][1]['pos'] = dict(worker_pos)
+        p['teamOur']['roles'][1]['backpack'] = ['WallUpgradeVoucher1']
+        m = Memory(day=1)
+        planner = Planner(Turn.load(p), p, m)
+        return planner, wall
+
+    def test_night_moves_to_inner_side_of_wall(self):
+        sites = wall_sites(Turn.load(payload()))
+        wall = sites[0]
+        station = Pos(10, 24)
+        # 从正下方接近: 内侧(靠基地)与外侧站位代价相同, 应选内侧
+        planner, wall = self.setup_night({'x': wall.x, 'y': wall.y + 4})
+        planner.run()
+        cmd = planner.commands.get('2')
+        self.assertEqual(cmd['action'], 'move', cmd)
+        tgt = Pos.load(cmd['targetPos'][0])
+        outer = Pos(wall.x + 1, wall.y) if wall.x > station.x else Pos(wall.x - 1, wall.y)
+        # 选中的站位应比"外侧格"更靠近基地
+        self.assertLessEqual(distance(tgt, station), distance(outer, station), (tgt, outer))
+        self.assertLess(distance(tgt, station), distance(Pos(wall.x, wall.y), station) + 2)
+
+    def test_inner_adjacent_uses_in_place(self):
+        # 已在靠基地的内侧 -> 就地使用, 不白费一回合
+        sites = wall_sites(Turn.load(payload()))
+        wall = sites[0]
+        station = Pos(10, 24)
+        inner = min((Pos(wall.x + dx, wall.y + dy)
+                     for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy),
+                    key=lambda q: distance(q, station))
+        planner, wall = self.setup_night(inner.dump())
+        planner.run()
+        cmd = planner.commands.get('2')
+        self.assertEqual(cmd['action'], 'use', cmd)
+
+    def test_daytime_does_not_require_inner_side(self):
+        # 白天没有机器人威胁, 站位仍按最短路(不改动既有行为)
+        sites = wall_sites(Turn.load(payload()))
+        wall = sites[0]
+        p = payload(day=1, gold=0, walls=[unit(40, 'wall', wall.x, wall.y, health=1000)])
+        p['roundNo'] = 30                    # 白天
+        p['teamOur']['roles'][1]['pos'] = {'x': wall.x, 'y': wall.y + 4}
+        p['teamOur']['roles'][1]['backpack'] = ['WallUpgradeVoucher1']
+        m = Memory(day=1)
+        planner = Planner(Turn.load(p), p, m)
+        planner.run()
+        cmd = planner.commands.get('2')
+        if cmd and cmd['action'] == 'move':
+            tgt = Pos.load(cmd['targetPos'][0])
+            self.assertGreaterEqual(distance(tgt, Pos(10, 24)), 1)
