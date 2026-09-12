@@ -20,6 +20,7 @@ DAY_PLAN={1:{'front_walls':0,'weapons':2},
           2:{'front_walls':4,'weapons':1},
           3:{'front_walls':4,'weapons':2}}
 DAY_PLAN_DEFAULT={'front_walls':4,'weapons':2}
+DAY1_ORE_PHASE_ROUNDS=30                  # 第1天先赚钱: 前30回合全员采铁/铜, 之后再采石修墙
 SPEND_WALL_VOUCHER=20                     # 回家前清钱: 围墙券价(参考)
 SPEND_FIXER=10                            # 回家前清钱: 修复包价
 SPEND_TRIP_SLACK=3                        # 清钱时点余量(回合)
@@ -183,20 +184,29 @@ class Economy:
         # One purchasing courier at a time; the other worker keeps producing money.
         if any(j.get('type') in ('upgrade','order') for j in self.m.jobs.values()): return
         shops=[q for q,k in self.turn.zones.items() if k=='weaponShop']
-        # 武器升级优先级最高(尽快升满): 在还有武器未满级时, 为"下一张武器券"保留金币,
-        # 围墙券只能用超出的闲钱 —— 否则 20 金的围墙券会把买武器券(100/150)的钱花光。
+        # 要求4/5: 每天最高优先级是赚钱升级; 券的取舍按天兜底:
+        #   - 当天武器配额(第1天=2, 第2天=1, 第3天起=2)未完成时, 武器券优先;
+        #   - 第2天半圈围墙还没修完时, 围墙券优先(入夜前必须修完整);
+        #   - 其余情况为"下一张武器券"保留金币, 围墙券只吃闲钱。
+        # 要求5: 武器升级券优先于围墙升级券 -> 为"下一张武器券"保留金币,
+        # 围墙券只吃超出的闲钱(围墙靠工人用石头现场修, 不靠券抢钱)。
         weapon_reserve=0
         for w in self.turn.weapons():
             lv=max(1,min(3,w.level))
             if lv<3:
                 need='WeaponUpgradeVoucher%d'%lv
                 weapon_reserve=max(weapon_reserve,int(self.p.shop_prices.get(need,0)))
-
         for priority,level,uid,item,target in self.options():
             price=self.p.shop_prices.get(item)
             if price is None or price>self.p.gold: continue
+            # 本次计划购买的数量(批量), 需在预算判断之前算出
+            need=(self.wall_quota_left() if item.startswith('Wall')
+                  else self.weapon_quota_left() if item.startswith('Weapon') else 1)
+            held=sum(r.backpack.count(item) for r in self.turn.controllable())
+            buy_n=max(1,min(max(1,need-held), int(self.p.gold//price)))
             if item.startswith('Wall') and weapon_reserve>0:
-                if self.p.gold-price < weapon_reserve: continue
+                # 按"本次实际花费"(单价*数量)判断, 否则批量购买会绕过武器券预算
+                if self.p.gold-price*buy_n < weapon_reserve: continue
             # 第一天: 围墙是"用石头现场建"的，不得用采购额度抢武器升级的预算；
             # 武器升级券与保命项照常允许（需求3: 武器升级尽量在第一天完成）。
             day=self.m.day or ((self.turn.round_no-1)//130+1)
@@ -216,12 +226,7 @@ class Economy:
                         choices.append((cost,role,shop))
             if choices:
                 _,role,shop=min(choices,key=lambda x:x[0])
-                # 批量采购: 同一种券一次买够(受当天配额与金币限制), 避免为同一件东西
-                # 反复跑商店 —— buy 动作支持 num。
-                need=(self.wall_quota_left() if item.startswith('Wall')
-                      else self.weapon_quota_left() if item.startswith('Weapon') else 1)
-                held=sum(r.backpack.count(item) for r in self.turn.controllable())
-                buy_n=max(1,min(max(1,need-held), int(self.p.gold//price)))
+                # 批量采购: 同一种券一次买够(受当天配额与金币限制, 见上方 need/buy_n)
                 self.m.jobs[role.unit_id]={'type':'upgrade','unit':uid,'item':item,
                     'level':level,'bought':False,'price':price,'shop':shop,'num':buy_n}
                 self.m.event(f'worker {role.unit_id}: purchase {buy_n}x {item} for building {uid}')
@@ -336,6 +341,12 @@ class Economy:
         if not options:
             return False
         options.sort()
+        # 武器升级券优先: 当天武器升级还没完成、而手上钱又买不起武器券时,
+        # 不要把闲钱花在围墙券/修复包上(攒着, 尽快把武器升上去)
+        needs_weapon=any(max(1,min(3,w.level))<3 for w in self.turn.weapons())
+        if (needs_weapon and self.weapon_quota_left()>0
+                and not any(o[2].startswith('Weapon') for o in options)):
+            return False
         item,price=options[0][2],options[0][3]
         # 只在"去商店 + 买 + 回家"仍来得及的情况下绕路
         stand=routes.adjacent(shop)
@@ -435,35 +446,29 @@ class Economy:
 
     # ---------------------------------------------------------------- 矿工分工
     def stone_needed(self):
-        """是否还需要专人采石: 建墙缺格 或 在途石头不足以补齐。"""
+        """是否还需要采石: 建墙缺格 或 在途石头不足以补齐。"""
         missing=len(self.p.missing_walls())
         if missing<=0: return False
         stock=sum(r.backpack.count('stone') for r in self.turn.workers())
         return stock<missing
 
     def family(self,role):
-        """矿工分工: 固定一名采石工供建墙材料，其余工采矿(铁/铜)。
+        """采石/采矿的统筹（要求3、5）:
 
-        避免两人都去采石导致矿石收入为零（效率过低）。
-        墙建齐或石头足够时全员转为采矿。
+        - 第1天前 DAY1_ORE_PHASE_ROUNDS 回合: 全员采铁/铜赚钱(先攒升级的钱);
+        - 之后只要迎敌半圈还没修完, 两名工人一起采石把墙修好(第2天也要在入夜前修完整);
+        - 半圈修完(或不缺石头): 全员采矿赚钱。
         """
-        workers=sorted(self.turn.workers(),key=lambda r:r.unit_id)
-        ids=[r.unit_id for r in workers]
-        if not ids: return 'ore'
-        if not self.stone_needed():
+        rod=(self.turn.round_no-1)%130+1        # 当天回合号(1..130)
+        if self.m.day==1 and rod<=DAY1_ORE_PHASE_ROUNDS:
             self.m.mining_roles={}
             return 'ore'
-        stone_id=self.m.mining_roles.get('stone')
-        if stone_id not in ids:
-            # 固定取 unit_id 最小者采石，其余采矿（不随回合漂移）
-            stone_id=ids[0]
-            self.m.mining_roles={'stone':stone_id}
-            self.m.event(f'worker {stone_id}: assigned to stone, others to ore')
-        return 'stone' if role.unit_id==stone_id else 'ore'
+        return 'stone' if self.stone_needed() else 'ore'
 
     def wanted_kinds(self,role):
         fam=self.family(role)
-        return ('stone',) if fam=='stone' else ('iron','copper')
+        if fam=='stone': return ('stone',)
+        return ('iron','copper')          # 赚钱阶段优先铁/铜(单价高)
 
     def sale_candidates(self,role,routes,extra=None):
         stock=Counter(x for x in role.backpack if x in ORES)
@@ -495,6 +500,8 @@ class Economy:
             if kinds is not None and kind not in kinds: continue
             # 一趟尽量采够(MIN_MINE_BATCH 起步, 受矿点剩余与背包容量限制)
             left_in_mine=max(1,10-self.m.mine_used.get(mine,0)-self.mine_claims[mine])
+            if self.mine_claims.get(mine,0)>0:
+                continue        # 要求6: 两名工人不同时采同一个矿
             quantity=min(capacity,left_in_mine)
             quantity=min(capacity,max(quantity,min(MIN_MINE_BATCH,left_in_mine)))
             sales=len(set(stock)|{kind})
@@ -510,8 +517,10 @@ class Economy:
                         max_q=min(quantity,self.p.remaining-approach-trip-sales-home-6)
                         if max_q<1: continue
                         for q in range(1,int(max_q)+1):
+                            # 评分 = 金币/回合: 分母含"去矿 + 采集 + 去小贩 + 回家"全程,
+                            # 因此离家近、离小贩近的矿天然占优(要求3/6 距离优先)
                             time=approach+q+trip+sales
-                            score=(inventory_value+price*q)/time
+                            score=(inventory_value+price*q)/max(1,time+home)
                             candidates.append({'score':score,'target':mine,'kind':kind,
                                 'entry':entry,'vendor':vendor,'exit':exit,'left':q,
                                 'total':time+home+5,'price':price,'type':'mine'})

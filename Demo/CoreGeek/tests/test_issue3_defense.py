@@ -47,7 +47,10 @@ class WallRepairTests(unittest.TestCase):
         p = payload(day=2, gold=200, walls=[
             unit(40, 'wall', front.x, front.y, health=400)])      # 40% 血量, 1级
         p['teamOur']['roles'][1]['backpack'] = ['WallFixer']
-        p['teamOur']['roles'][1]['pos'] = {'x': front.x, 'y': front.y - 1}
+        # 夜间必须站在靠基地内侧(外侧会被机器人打)
+        inner = min(((max(abs(front.x+dx-10), abs(front.y+dy-24)), (front.x+dx, front.y+dy))
+                     for dx in (-1,0,1) for dy in (-1,0,1) if dx or dy))[1]
+        p['teamOur']['roles'][1]['pos'] = {'x': inner[0], 'y': inner[1]}
         m = Memory(day=2)
         planner = Planner(Turn.load(p), p, m)
         role = [w for w in planner.turn.workers() if w.unit_id == 2][0]
@@ -64,7 +67,10 @@ class WallRepairTests(unittest.TestCase):
         p = payload(day=2, gold=200, walls=[
             unit(40, 'wall', front.x, front.y, health=900)])      # 90% 血量
         p['teamOur']['roles'][1]['backpack'] = ['WallFixer']
-        p['teamOur']['roles'][1]['pos'] = {'x': front.x, 'y': front.y - 1}
+        # 夜间必须站在靠基地内侧(外侧会被机器人打)
+        inner = min(((max(abs(front.x+dx-10), abs(front.y+dy-24)), (front.x+dx, front.y+dy))
+                     for dx in (-1,0,1) for dy in (-1,0,1) if dx or dy))[1]
+        p['teamOur']['roles'][1]['pos'] = {'x': inner[0], 'y': inner[1]}
         m = Memory(day=2)
         planner = Planner(Turn.load(p), p, m)
         planner.economic.prepare()
@@ -77,7 +83,10 @@ class WallRepairTests(unittest.TestCase):
             unit(40, 'wall', front.x, front.y, health=400),
             unit(41, 'wall', side.x, side.y, health=400)])
         p['teamOur']['roles'][1]['backpack'] = ['WallFixer']
-        p['teamOur']['roles'][1]['pos'] = {'x': front.x, 'y': front.y - 1}
+        # 夜间必须站在靠基地内侧(外侧会被机器人打)
+        inner = min(((max(abs(front.x+dx-10), abs(front.y+dy-24)), (front.x+dx, front.y+dy))
+                     for dx in (-1,0,1) for dy in (-1,0,1) if dx or dy))[1]
+        p['teamOur']['roles'][1]['pos'] = {'x': inner[0], 'y': inner[1]}
         m = Memory(day=2)
         planner = Planner(Turn.load(p), p, m)
         options = planner.economic.options()
@@ -104,7 +113,10 @@ class WallRepairTests(unittest.TestCase):
             unit(40, 'wall', front.x, front.y, health=200)])      # 20% 血量
         p['roundNo'] = 85                                            # 夜晚
         p['teamOur']['roles'][1]['backpack'] = ['WallFixer']
-        p['teamOur']['roles'][1]['pos'] = {'x': front.x, 'y': front.y - 1}
+        # 夜间必须站在靠基地内侧(外侧会被机器人打)
+        inner = min(((max(abs(front.x+dx-10), abs(front.y+dy-24)), (front.x+dx, front.y+dy))
+                     for dx in (-1,0,1) for dy in (-1,0,1) if dx or dy))[1]
+        p['teamOur']['roles'][1]['pos'] = {'x': inner[0], 'y': inner[1]}
         m = Memory(day=1)
         r = decide_response(p, m)
         cmd = r['roleCommandMap'].get('2')
@@ -210,9 +222,13 @@ if __name__ == '__main__':
 class SpendBeforeHomeTests(unittest.TestCase):
     """回家前把闲钱花完: 30 -> 围墙券+修复包; 20 -> 围墙券; 10 -> 修复包。"""
 
-    def planner_at_dusk(self, gold, backpack=None):
+    def planner_at_dusk(self, gold, backpack=None, weapons_maxed=True):
         sites = wall_sites(Turn.load(payload()))
         p = payload(day=2, gold=gold, walls=[unit(40, 'wall', sites[0].x, sites[0].y, health=1000)])
+        if weapons_maxed:
+            for u in p['teamOur']['roles']:
+                if u['roleType'] in ('rocket', 'railgun', 'gatling'):
+                    u['level'] = 3          # 武器已满级 -> 闲钱才轮到围墙券/修复包
         # 站在商店(7,24)旁, 且仍有余额能在死线前回家
         p['teamOur']['roles'][1]['pos'] = {'x': 8, 'y': 24}
         if backpack:
@@ -240,10 +256,15 @@ class SpendBeforeHomeTests(unittest.TestCase):
         self.assertEqual(planner.commands['2']['name'], 'WallFixer')
 
     def test_hundred_buys_weapon_voucher_first(self):
-        planner, role = self.planner_at_dusk(100)
+        planner, role = self.planner_at_dusk(100, weapons_maxed=False)
         self.assertTrue(planner.economic.spend_before_home(role, planner.route(role)))
         self.assertEqual(planner.commands['2']['name'], 'WeaponUpgradeVoucher1')
 
     def test_no_spend_without_affordable_item(self):
         planner, role = self.planner_at_dusk(5)
+        self.assertFalse(planner.economic.spend_before_home(role, planner.route(role)))
+
+    def test_no_wall_spend_while_weapon_upgrade_pending(self):
+        # 武器配额未完成且钱不够买武器券 -> 攒钱, 不买围墙券/修复包
+        planner, role = self.planner_at_dusk(30, weapons_maxed=False)
         self.assertFalse(planner.economic.spend_before_home(role, planner.route(role)))

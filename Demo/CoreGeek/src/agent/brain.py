@@ -11,9 +11,11 @@ from .geography import Geography
 from .economy import Economy
 from .tasks import Tasks
 from .protocol import Pos, Turn, distance, station_footprint, move_command
+from .economy import DAY1_ORE_PHASE_ROUNDS
 
-LOADOUT = ("rocket", "rocket", "railgun")
+LOADOUT = ("rocket", "rocket", "rocket")   # 要求: 75 金币开局买三座火箭炮
 RETURN_MARGIN = 2          # 回到武器旁的少量安全余量
+INNER_STAND_SLACK = 8      # 夜间交互站位: 为走到"靠基地内侧"最多多走的步数
 RETURN_DEADLINE = 75       # 当天第75回合(含入夜前5回合)前必须回到武器塔旁; 夜间允许移动
 
 
@@ -100,8 +102,42 @@ class Planner:
         self.reserved.add(step)
         return True
 
+    def inner_stand(self, routes, target, action):
+        """夜间交互站位: 只返回严格"靠基地一侧"的相邻格(代价允许时), 否则 None。
+
+        站在围墙外侧会暴露在机器人攻击范围内, 因此夜间对建筑使用券/修复包时,
+        要绕到内侧再动手; 内侧不可达(超出允许步数)时返回 None, 由调用方退回
+        最短路站位, 保证不会来回打转。
+        """
+        if self.turn.is_day or action not in ('use', 'build'):
+            return None
+        station = self.turn.station()
+        if station is None:
+            return None
+        target_d = distance(target, station.pos)
+        cands = [q for q in neighbours(target)
+                 if q in routes.cost and distance(q, station.pos) < target_d]
+        if not cands:
+            return None
+        best = min(routes.cost[q] for q in cands)
+        near = [q for q in cands if routes.cost[q] <= best + INNER_STAND_SLACK]
+        if not near:
+            return None
+        return min(near, key=lambda q: (distance(q, station.pos), routes.cost[q], q.x, q.y))
+
     def interact(self, role, routes, target, action, **fields):
-        stand = routes.adjacent(target)
+        """与目标交互: 白天走最短路; 夜间优先站到靠基地的内侧再动作。"""
+        stand = None
+        station = self.turn.station()
+        inner = self.inner_stand(routes, target, action)
+        if inner is not None and station is not None:
+            if routes.distance(target) == 0 and \
+                    distance(role.pos, station.pos) <= distance(inner, station.pos):
+                stand = role.pos          # 已在可交互位置且不比内侧更外 -> 就地动作
+            else:
+                stand = inner
+        if stand is None:
+            stand = routes.adjacent(target)
         if stand is None:
             return False
         if stand == role.pos:
@@ -147,9 +183,6 @@ class Planner:
                             if self.memory.jobs.get(r.unit_id,{}).get('type')!='upgrade'),None)
         for role in workers:
             routes = self.route(role)
-            # 第一天: 先建完半圈围墙（用石头, 不走商店）, 之后才安排券的采购/送达
-            if self.memory.day==1 and self.missing_walls() and self.build_wall(role,routes):
-                continue
             # Using a voucher in place takes one turn and must not be suppressed
             # by the generic five-turn return margin.
             if self.economic.act_urgent(role,routes):
@@ -209,6 +242,9 @@ class Planner:
             return False
         stock = role.backpack.count('stone')
         batch = min(3, (len(missing)+1)//2)
+        # 要求3: 第1天前 30 回合先全员采铁/铜赚钱, 之后再采石修墙(不提前耗在采石上)
+        if self.memory.day == 1 and (self.turn.round_no - 1) % 130 + 1 <= DAY1_ORE_PHASE_ROUNDS:
+            return False
         # 采石分工: 只有被指派采石的工人去攒石头，另一名工人留给经济模块采矿石，
         # 避免"两人都去采石头"导致矿石收入为零（需求2）。
         # 半圈围墙没搭完之前, 两名工人都可以采石建墙（先把防线立起来）;
@@ -217,16 +253,20 @@ class Planner:
                          or bool(missing))
         nearby = [p for p, kind in self.turn.zones.items()
                   if kind == 'stone' and distance(role.pos, p) <= 1
-                  and not self.economic.blocked(p,kind)]
+                  and not self.economic.blocked(p,kind)
+                  and self.economic.mine_claims.get(p, 0) == 0]
         if stone_fetcher and nearby and stock < batch and not role.backpack_full:
             target = nearby[0]
             if self.enough_time(role, routes, target, batch-stock):
                 return self.interact(role, routes, target, 'collect', targetPos=[target.dump()])
         if not stock and stone_fetcher:
             # Once established, reserve only a small stone batch per trip.
-            mines = [p for p, kind in self.turn.zones.items() if kind == 'stone' and not self.economic.blocked(p,kind)]
+            mines = [p for p, kind in self.turn.zones.items()
+                     if kind == 'stone' and not self.economic.blocked(p,kind)
+                     and self.economic.mine_claims.get(p, 0) == 0]
             for target in sorted(mines, key=routes.distance):
                 if not role.backpack_full and self.enough_time(role, routes, target, 3):
+                    self.economic.mine_claims[target] += 1      # 认领, 避免两人同矿
                     return self.interact(role, routes, target, 'collect', targetPos=[target.dump()])
             return False
         if not stock:

@@ -237,12 +237,17 @@ class NightVoucherDeliveryTests(unittest.TestCase):
             p['teamOur']['roles'][1]['backpack'] = list(backpack)
         return p, sites[0]
 
-    def test_night_uses_voucher_when_already_adjacent(self):
-        # 工人贴着受损/待升级的墙 -> 夜里直接使用券
+    def inner_cell(self, wall, station=Pos(10, 24)):
+        return min((Pos(wall.x + dx, wall.y + dy)
+                    for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy),
+                   key=lambda q: distance(q, station))
+
+    def test_night_uses_voucher_when_already_on_inner_side(self):
+        # 已站在靠基地内侧 -> 夜里直接使用券
         sites = wall_sites(Turn.load(payload()))
         p = payload(day=1, gold=0, walls=[unit(40, 'wall', sites[0].x, sites[0].y, health=1000)])
         p['roundNo'] = 85
-        p['teamOur']['roles'][1]['pos'] = {'x': sites[0].x, 'y': sites[0].y - 1}
+        p['teamOur']['roles'][1]['pos'] = self.inner_cell(sites[0]).dump()
         p['teamOur']['roles'][1]['backpack'] = ['WallUpgradeVoucher1']
         m = Memory(day=1)
         planner = Planner(Turn.load(p), p, m)
@@ -251,6 +256,26 @@ class NightVoucherDeliveryTests(unittest.TestCase):
         self.assertIsNotNone(cmd, planner.commands)
         self.assertEqual(cmd['action'], 'use')
         self.assertEqual(cmd['name'], 'WallUpgradeVoucher1')
+
+    def test_night_moves_to_inner_side_when_adjacent_outside(self):
+        # 贴墙但在外侧 -> 先绕到内侧再用(外侧会被机器人打)
+        sites = wall_sites(Turn.load(payload()))
+        wall = sites[0]
+        station = Pos(10, 24)
+        outside = max((Pos(wall.x + dx, wall.y + dy)
+                       for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy),
+                      key=lambda q: distance(q, station))
+        p = payload(day=1, gold=0, walls=[unit(40, 'wall', wall.x, wall.y, health=1000)])
+        p['roundNo'] = 85
+        p['teamOur']['roles'][1]['pos'] = outside.dump()
+        p['teamOur']['roles'][1]['backpack'] = ['WallUpgradeVoucher1']
+        m = Memory(day=1)
+        planner = Planner(Turn.load(p), p, m)
+        planner.run()
+        cmd = planner.commands.get('2')
+        self.assertEqual(cmd['action'], 'move', cmd)
+        tgt = Pos.load(cmd['targetPos'][0])
+        self.assertLess(distance(tgt, station), distance(outside, station), '应走向更靠基地的一侧')
 
     def test_night_moves_toward_target_when_carrying_voucher(self):
         # 拿着券但不在墙边 -> 夜里也要朝墙走过去用掉(而不是直接去武器位)

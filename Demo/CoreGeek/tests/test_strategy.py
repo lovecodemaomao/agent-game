@@ -49,14 +49,15 @@ def apply_construction(p, commands):
 
 class BasicStrategyTests(unittest.TestCase):
     def test_spawn_builds_two_then_completes_loadout(self):
+        # 要求: 75 金币开局买三座火箭炮(25*3)
         p = fixture()
         commands = decide(p)
         self.assertEqual(sum(c['action']=='build' for c in commands.values()), 2)
         apply_construction(p, commands)
         apply_construction(p, decide(p))
         kinds = [r['roleType'] for r in p['teamOur']['roles']]
-        self.assertEqual(kinds.count('rocket'), 2)
-        self.assertEqual(kinds.count('railgun'), 1)
+        self.assertEqual(kinds.count('rocket'), 3, kinds)
+        self.assertEqual(kinds.count('railgun'), 0)
         self.assertEqual(p['teamOur']['goldNum'], 0)
 
     def test_shared_budget(self):
@@ -210,7 +211,10 @@ class BasicStrategyTests(unittest.TestCase):
         turn=Turn.load(p)
         self.assertEqual(len(turn.weapons()),3)
         self.assertEqual(len(turn.walls()),10)
+        # 允许"回家前先去商店花掉闲钱"的短途绕行: 就位武器旁 或 在商店旁
+        shop = next((q for q,k in turn.zones.items() if k=='weaponShop'), None)
         self.assertTrue(all(any(distance(r.pos,t.pos)<=1 for t in turn.weapons())
+                            or (shop is not None and distance(r.pos, shop) <= 2)
                             for r in turn.controllable()))
 
     def test_railgun_energy_conserved(self):

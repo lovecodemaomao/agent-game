@@ -107,48 +107,83 @@ class ProbeTests(unittest.TestCase):
 
 
 class MiningRoleTests(unittest.TestCase):
-    def test_one_worker_mines_stone_and_the_other_mines_ore(self):
+    def test_day1_first_30_rounds_all_mine_ore_for_money(self):
+        # 要求: 第1天一开始两名工人都去采铁/铜赚钱
         p = two_worker_payload(day=1)
-        m = Memory()
-        planner = Planner(Turn.load(p), p, m)
-        eco = planner.economic
-        workers = sorted(planner.turn.workers(), key=lambda r: r.unit_id)
-        kinds = [eco.wanted_kinds(w) for w in workers]
-        self.assertEqual(kinds, [('stone',), ('iron', 'copper')], kinds)
-        # 目标矿种确实按分工挑选
-        chosen = []
-        for w, allowed in zip(workers, kinds):
-            routes = planner.route(w)
-            cands = eco.mining_candidates(w, routes, allowed)
-            self.assertTrue(cands, f'worker {w.unit_id} 应有可用矿点')
-            chosen.append({c['kind'] for c in cands})
-        self.assertEqual(chosen[0], {'stone'})
-        self.assertTrue(chosen[1] <= {'iron', 'copper'})
-
-    def test_both_workers_never_mine_stone_when_walls_missing(self):
-        p = two_worker_payload(day=1)
-        m = Memory()
+        p['roundNo'] = 10                     # 第1天前 30 回合内
+        m = Memory(day=1)
         planner = Planner(Turn.load(p), p, m)
         kinds = [planner.economic.wanted_kinds(w) for w in planner.turn.workers()]
-        self.assertEqual(sum(k == ('stone',) for k in kinds), 1, kinds)
+        self.assertTrue(all(k == ('iron', 'copper') for k in kinds), kinds)
 
-    def test_all_workers_move_to_ore_once_walls_complete(self):
+    def test_no_stone_fetching_in_first_30_rounds_of_day1(self):
+        # 要求3: 第1天前30回合不采石(先赚钱), build_wall 也不得驱动采石
+        p = two_worker_payload(day=1)
+        p['roundNo'] = 10
+        m = Memory(day=1)
+        planner = Planner(Turn.load(p), p, m)
+        for w in planner.turn.workers():
+            self.assertFalse(planner.build_wall(w, planner.route(w)),
+                             f'worker {w.unit_id} 不应在前30回合采石/建墙')
+
+    def test_day1_after_30_rounds_both_fetch_stone_for_front_walls(self):
+        # 要求: 第1天30回合后两人一起去采石, 把前方围墙修好
+        p = two_worker_payload(day=1)
+        p['roundNo'] = 40                     # 第1天第40回合
+        m = Memory(day=1)
+        planner = Planner(Turn.load(p), p, m)
+        kinds = [planner.economic.wanted_kinds(w) for w in planner.turn.workers()]
+        self.assertTrue(all(k == ('stone',) for k in kinds), kinds)
+
+    def test_day2_both_fetch_stone_until_ring_complete(self):
+        # 要求5: 第2天入夜前必须把半圈修完整 -> 未完成时两人一起采石
         p = two_worker_payload(day=2)
-        p['mapInfo']['zones'] = [
-            {'pos': {'x': 6, 'y': 24}, 'neutralType': 'stone'},
-            {'pos': {'x': 6, 'y': 22}, 'neutralType': 'copper'},
-            {'pos': {'x': 5, 'y': 24}, 'neutralType': 'vendor'},
-            {'pos': {'x': 7, 'y': 24}, 'neutralType': 'weaponShop'},
-        ]
-        # 按真实墙位把迎敌半圈建满；墙齐后不需要专人采石
+        m = Memory(day=2)
+        planner = Planner(Turn.load(p), p, m)
+        kinds = [planner.economic.wanted_kinds(w) for w in planner.turn.workers()]
+        self.assertTrue(all(k == ('stone',) for k in kinds), kinds)
+
+    def test_ring_complete_then_all_mine_ore(self):
+        p = two_worker_payload(day=2, gold=75)
         sites = wall_sites(Turn.load(p))
-        self.assertTrue(sites)
-        p['teamOur']['roles'] += [unit(40 + i, 'wall', q.x, q.y)
+        p['teamOur']['roles'] += [unit(40 + i, 'wall', q.x, q.y, health=1000)
                                   for i, q in enumerate(sites)]
         m = Memory(day=2)
         planner = Planner(Turn.load(p), p, m)
         kinds = [planner.economic.wanted_kinds(w) for w in planner.turn.workers()]
         self.assertTrue(all(k == ('iron', 'copper') for k in kinds), kinds)
+
+    def test_two_workers_pick_different_mines(self):
+        # 要求6: 两名工人联合选点, 不同时采同一个矿
+        p = two_worker_payload(day=2)
+        m = Memory(day=2)
+        planner = Planner(Turn.load(p), p, m)
+        workers = sorted(planner.turn.workers(), key=lambda r: r.unit_id)
+        chosen = []
+        for w in workers:
+            routes = planner.route(w)
+            cands = planner.economic.mining_candidates(w, routes)
+            self.assertTrue(cands, f'worker {w.unit_id} 应有候选矿点')
+            best = max(cands, key=lambda c: c['score'])
+            chosen.append(best['target'])
+            planner.economic.mine_claims[best['target']] += best['left']
+        self.assertNotEqual(chosen[0], chosen[1], '两名工人应选不同矿点')
+
+    def test_nearer_home_mine_scores_higher(self):
+        # 距离优先: 同等矿价下, 离家(回防线)更近的那处评分更高
+        p = two_worker_payload(day=2, zones=[
+            {'pos': {'x': 8, 'y': 24}, 'neutralType': 'iron'},      # 离家近
+            {'pos': {'x': 30, 'y': 10}, 'neutralType': 'iron'},     # 离家远
+            {'pos': {'x': 5, 'y': 24}, 'neutralType': 'vendor'},
+        ])
+        m = Memory(day=2)
+        planner = Planner(Turn.load(p), p, m)
+        role = planner.turn.workers()[0]
+        cands = planner.economic.mining_candidates(role, planner.route(role))
+        near = max((c for c in cands if c['target'] == Pos(8, 24)), key=lambda c: c['score'], default=None)
+        far = max((c for c in cands if c['target'] == Pos(30, 10)), key=lambda c: c['score'], default=None)
+        self.assertIsNotNone(near); self.assertIsNotNone(far)
+        self.assertGreater(near['score'], far['score'])
 
 
 class UpgradeOrderTests(unittest.TestCase):
