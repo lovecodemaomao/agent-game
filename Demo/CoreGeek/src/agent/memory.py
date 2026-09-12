@@ -25,7 +25,11 @@ class Memory:
     mine_used: dict = field(default_factory=dict)
     mine_blocked_until: dict = field(default_factory=dict)
     mining_roles: dict = field(default_factory=dict)   # 矿工分工: {'stone': unit_id}
-    summon_order_done: bool = False                    # 第一天优先召唤令是否已购买并使用
+    summon_order_done: bool = False                    # 召唤令是否已购买并使用
+    day_wall_upgrades: int = 0                         # 当天已完成的围墙升级数
+    day_weapon_upgrades: int = 0                       # 当天已完成的武器升级数
+    levels: dict = field(default_factory=dict)         # 建筑等级快照: {unit_id: level}
+    day_upgrades: dict = field(default_factory=dict)   # 每日已完成升级: {day: {'wall': n, 'weapon': n}}
     previous_mines: dict = field(default_factory=dict)
     failed_steps: dict = field(default_factory=dict)
     response: dict | None = None
@@ -41,6 +45,8 @@ class Memory:
             self.day = day
             self.llm_used = 0
             self.news_attempts = 0
+            self.day_wall_upgrades = 0
+            self.day_weapon_upgrades = 0
         if any(e.get('errorCode') == 5 for e in payload.get('errors', [])):
             self.llm_used = 3
         roles = {str(r.unit_id): r for r in turn.controllable()}
@@ -80,6 +86,17 @@ class Memory:
                     if job['failures'] >= 3:
                         self.jobs.pop(role.unit_id, None)
                         self.event(f'worker {uid}: replan after 3 failed actions')
+        # 统计"当天完成了多少次围墙/武器升级"（用于每日必完成配额）
+        for unit in turn.ours:
+            key = 'wall' if unit.kind == 'wall' else ('weapon' if unit.kind in
+                   ('gatling','railgun','rocket') else None)
+            if key is None:
+                continue
+            before = self.levels.get(unit.unit_id)
+            self.levels[unit.unit_id] = max(1, min(3, unit.level))
+            if before is not None and unit.level > before:
+                bucket = self.day_upgrades.setdefault(day, {'wall': 0, 'weapon': 0})
+                bucket[key] += unit.level - before
         self.previous_mines = mines
         for uid in list(self.jobs):
             if str(uid) not in roles:

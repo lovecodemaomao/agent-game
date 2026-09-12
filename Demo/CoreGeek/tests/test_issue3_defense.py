@@ -115,18 +115,24 @@ class WallRepairTests(unittest.TestCase):
 
 class FixerReserveTests(unittest.TestCase):
     def maxed(self, gold):
-        """全部满级且已建墙 -> 此时应把余钱用于储备修复包。"""
+        """全部满级且已建墙 -> 无券可买, 余钱才轮到储备修复包。"""
         sites = wall_sites(Turn.load(payload()))
-        p = payload(day=2, gold=gold, walls=[unit(40 + i, 'wall', q.x, q.y, health=1000)
+        p = payload(day=2, gold=gold, walls=[unit(40 + i, 'wall', q.x, q.y, health=2000, level=3)
                                              for i, q in enumerate(sites[:3])])
         for u in p['teamOur']['roles']:
             if u['roleType'] in ('rocket', 'railgun', 'station'):
                 u['level'] = 3
         return p
 
+    def quotas_done(self, m):
+        """模拟当天围墙/武器配额已完成, 余钱才轮到修复包。"""
+        m.day_wall_upgrades = 4
+        m.day_weapon_upgrades = 2
+        return m
+
     def test_reserves_up_to_three_fixers(self):
         p = self.maxed(150)
-        m = Memory(day=2)
+        m = self.quotas_done(Memory(day=2))
         planner = Planner(Turn.load(p), p, m)
         planner.economic.prepare()
         jobs = [j for j in m.jobs.values() if j.get('item') == 'WallFixer']
@@ -136,17 +142,30 @@ class FixerReserveTests(unittest.TestCase):
     def test_stops_reserving_at_target(self):
         p = self.maxed(150)
         p['teamOur']['roles'][1]['backpack'] = ['WallFixer'] * WALL_FIXER_RESERVE
-        m = Memory(day=2)
+        m = self.quotas_done(Memory(day=2))
         planner = Planner(Turn.load(p), p, m)
         planner.economic.prepare()
         self.assertFalse([j for j in m.jobs.values() if j.get('item') == 'WallFixer'], m.jobs)
 
-    def test_reserve_fires_while_keeping_weapon_voucher_budget(self):
-        # 仍有武器待升2级: 金币须高于"券价+100"才动用储备
+    def test_no_fixer_reserve_until_daily_quotas_done(self):
+        # 新规则: 当天的围墙/武器升级配额未完成时, 不买修复包(闲钱才买)
         sites = wall_sites(Turn.load(payload()))
-        p = payload(day=2, gold=120, walls=[unit(40, 'wall', sites[0].x, sites[0].y, health=1000)])
-        # 120 >= 10+100 -> 可储备
-        m = Memory(day=2)
+        p = payload(day=2, gold=300, walls=[unit(40, 'wall', sites[0].x, sites[0].y, health=1000)])
+        m = Memory(day=2)                     # 配额: 围墙4/武器1 均未完成
+        planner = Planner(Turn.load(p), p, m)
+        planner.economic.prepare()
+        self.assertFalse([j for j in m.jobs.values() if j.get('item') == 'WallFixer'], m.jobs)
+        self.assertTrue([j for j in m.jobs.values() if j.get('item','').startswith('Wall')]
+                        or [j for j in m.jobs.values() if j.get('item','').startswith('Weapon')], m.jobs)
+
+    def test_fixer_reserve_uses_spare_money_after_quotas(self):
+        # 配额完成后, 余钱才用于修复包
+        sites = wall_sites(Turn.load(payload()))
+        p = payload(day=2, gold=300, walls=[unit(40, 'wall', sites[0].x, sites[0].y, health=2000, level=3)])
+        m = Memory(day=2, day_wall_upgrades=4, day_weapon_upgrades=1)
+        for u in p['teamOur']['roles']:
+            if u['roleType'] in ('rocket', 'railgun'):
+                u['level'] = 3                 # 无武器券可买
         planner = Planner(Turn.load(p), p, m)
         planner.economic.prepare()
         self.assertTrue([j for j in m.jobs.values() if j.get('item') == 'WallFixer'], m.jobs)
@@ -154,10 +173,9 @@ class FixerReserveTests(unittest.TestCase):
     def test_reserve_never_assigned_to_worker_already_holding_fixer(self):
         # 回归: 曾把"补第2个修复包"派给已持有修复包的工人, 差事被立即弹掉
         # 造成每回合空转、采购名额被占死(200+金币却买不到任何升级券)
-        sites = wall_sites(Turn.load(payload()))
-        p = payload(day=2, gold=200, walls=[unit(40, 'wall', sites[0].x, sites[0].y, health=1000)])
+        p = self.maxed(200)                                       # 配额已无券可买
         p['teamOur']['roles'][1]['backpack'] = ['WallFixer']      # worker 2 已持有
-        m = Memory(day=2)
+        m = self.quotas_done(Memory(day=2))
         planner = Planner(Turn.load(p), p, m)
         planner.economic.prepare()
         jobs = [j for j in m.jobs.values() if j.get('item') == 'WallFixer']
@@ -187,3 +205,45 @@ class FixerReserveTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SpendBeforeHomeTests(unittest.TestCase):
+    """回家前把闲钱花完: 30 -> 围墙券+修复包; 20 -> 围墙券; 10 -> 修复包。"""
+
+    def planner_at_dusk(self, gold, backpack=None):
+        sites = wall_sites(Turn.load(payload()))
+        p = payload(day=2, gold=gold, walls=[unit(40, 'wall', sites[0].x, sites[0].y, health=1000)])
+        # 站在商店(7,24)旁, 且仍有余额能在死线前回家
+        p['teamOur']['roles'][1]['pos'] = {'x': 8, 'y': 24}
+        if backpack:
+            p['teamOur']['roles'][1]['backpack'] = list(backpack)
+        m = Memory(day=2)
+        planner = Planner(Turn.load(p), p, m)
+        role = [w for w in planner.turn.workers() if w.unit_id == 2][0]
+        return planner, role
+
+    def test_thirty_buys_wall_voucher_first(self):
+        planner, role = self.planner_at_dusk(30)
+        self.assertTrue(planner.economic.spend_before_home(role, planner.route(role)))
+        cmd = planner.commands['2']
+        self.assertEqual(cmd['action'], 'buy')
+        self.assertTrue(cmd['name'].startswith('Wall'), cmd)
+
+    def test_twenty_buys_wall_voucher(self):
+        planner, role = self.planner_at_dusk(20)
+        self.assertTrue(planner.economic.spend_before_home(role, planner.route(role)))
+        self.assertEqual(planner.commands['2']['name'], 'WallUpgradeVoucher1')
+
+    def test_ten_buys_fixer(self):
+        planner, role = self.planner_at_dusk(10)
+        self.assertTrue(planner.economic.spend_before_home(role, planner.route(role)))
+        self.assertEqual(planner.commands['2']['name'], 'WallFixer')
+
+    def test_hundred_buys_weapon_voucher_first(self):
+        planner, role = self.planner_at_dusk(100)
+        self.assertTrue(planner.economic.spend_before_home(role, planner.route(role)))
+        self.assertEqual(planner.commands['2']['name'], 'WeaponUpgradeVoucher1')
+
+    def test_no_spend_without_affordable_item(self):
+        planner, role = self.planner_at_dusk(5)
+        self.assertFalse(planner.economic.spend_before_home(role, planner.route(role)))

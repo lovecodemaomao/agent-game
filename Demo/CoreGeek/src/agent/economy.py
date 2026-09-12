@@ -11,7 +11,18 @@ HARVEST_BUFFER=2                          # 顺手采集只留 2 回合缓冲（
 NEAR_HOME_RADIUS=4                        # "家附近"判定半径（基地切比雪夫距离）
 HARVEST_DETOUR=2                          # 顺路判据: 多绕不超过 2 回合即视为顺手
 NIGHT_OVERRUN=12                          # 保留: 长差事允许的入夜余量
-WALL_FIXER_RESERVE=3                      # issue #3: 常备修复包数量(建议 2-3)
+WALL_FIXER_RESERVE=3                      # 常备修复包数量上限
+# 每日配额: 每天先围墙后武器, 满足当天目标后有余钱才买修复包
+#   day1: 建完半圈围墙(石头) + 两个武器升级
+#   day2: 4 个前挡围墙升级 + 一个武器升2级
+#   day3: 4 个前挡升2级 + 两个武器升2级
+DAY_PLAN={1:{'front_walls':0,'weapons':2},
+          2:{'front_walls':4,'weapons':1},
+          3:{'front_walls':4,'weapons':2}}
+DAY_PLAN_DEFAULT={'front_walls':4,'weapons':2}
+SPEND_WALL_VOUCHER=20                     # 回家前清钱: 围墙券价(参考)
+SPEND_FIXER=10                            # 回家前清钱: 修复包价
+SPEND_TRIP_SLACK=3                        # 清钱时点余量(回合)
 WALL_FIXER_BUDGET_KEEP=20                 # 无武器升级需求时, 买修复包只保留的金币
 WEAPON_VOUCHER_KEEP=100                   # 仍有武器待升2级时, 为其保留的券价
 HP={'station':(1500,3000,4500),'wall':(1000,1500,2000),
@@ -22,6 +33,19 @@ class Economy:
     def __init__(self,p):
         self.p=p; self.turn=p.turn; self.m=p.memory
         self.mine_claims=Counter()
+
+    def plan(self):
+        return DAY_PLAN.get(self.m.day or ((self.turn.round_no-1)//130+1), DAY_PLAN_DEFAULT)
+
+    def wall_quota_left(self):
+        """当天还需完成的围墙升级数量（没有可升级的围墙时视为已完成）。"""
+        upgradable=any(max(1,min(3,w.level))<2 for w in self.turn.walls())
+        if not upgradable: return 0
+        return max(0, self.plan()['front_walls'] - self.m.day_wall_upgrades)
+
+    def weapon_quota_left(self):
+        """当天还需完成的武器升级数量。"""
+        return max(0, self.plan()['weapons'] - self.m.day_weapon_upgrades)
 
     def wall_phase_active(self):
         """迎敌半圈围墙是否仍处于"补到2级"的阶段（未达半数即为是）。"""
@@ -46,6 +70,8 @@ class Economy:
         # 达标后武器升级接管（需求3: 围墙升级成功后若还有余量，再执行武器升级）。
         # 若不设这个"阶段完成"判据，10 座墙的券会一直插队，武器永远升不上去。
         wall_phase=self.wall_phase_active()
+        wall_quota=self.wall_quota_left()>0      # 当天围墙配额未完成 -> 围墙优先
+        weapon_quota=self.weapon_quota_left()>0  # 围墙配额完成后再升武器
         for u in (*self.turn.weapons(), *self.turn.walls(), self.turn.station()):
             if u is None: continue
             level=max(1,min(3,u.level)); ratio=u.health/HP[u.kind][level-1]
@@ -65,13 +91,12 @@ class Economy:
                 prefix='Station' if u.kind=='station' else 'Wall' if u.kind=='wall' else 'Weapon'
                 item=f'{prefix}UpgradeVoucher{level}'
                 if u.kind=='wall':
-                    # 前期让位武器升2级; 第3天起围墙阶段(升2级)优先, 完成后让位武器
-                    priority = (2 if level==1 else 3) if weapon_first else \
-                               (1 if (level==1 and wall_phase) else 3)
+                    # 每天先围墙: 配额内的前挡升2级最优先(位序按弧线前排加权)
+                    priority = 1 if (level==1 and wall_quota) else 3
                 elif u.kind=='rocket':
-                    priority=(1 if level==1 else 3) if weapon_first else (3 if wall_phase else 1)
+                    priority = 1.5 if weapon_quota else (2.5 if level==1 else 3)
                 else:                      # railgun / gatling
-                    priority=(1.5 if level==1 else 3.5) if weapon_first else (3.5 if wall_phase else 1.5)
+                    priority = 1.8 if weapon_quota else (2.8 if level==1 else 3.2)
             # 围墙: 越朝向机器人越优先（self.p.walls 已按迎敌方向由前到后排序），
             # 非迎敌半圈的墙排到最后；受损墙再略微提前（ratio 越小越靠前）。
             if u.kind=='wall':
@@ -112,25 +137,6 @@ class Economy:
                     break
         if not self.turn.is_day or len(self.turn.weapons())<3: return
         # issue #3 的修复包储备见下方（排在升级券采购之后）
-        # issue #3: 常备 WALL_FIXER_RESERVE 个修复包。
-        # 顺序很关键: 排在升级券采购之前, 否则 20 金的围墙券会一直插队、
-        # 储备永远买不到; 同时为"待升2级的武器"保留券价, 不抢武器升级预算。
-        # 只有确实建了围墙才需要修墙包。
-        needs_weapon_voucher=any(max(1,min(3,w.level))<2 for w in self.turn.weapons())
-        if (self.turn.walls()
-                and not any(j.get('type') in ('upgrade','order') for j in self.m.jobs.values())):
-            stock=sum(r.backpack.count('WallFixer') for r in self.turn.workers())
-            price=self.p.shop_prices.get('WallFixer')
-            keep=WEAPON_VOUCHER_KEEP if needs_weapon_voucher else WALL_FIXER_BUDGET_KEEP
-            if (price is not None and stock<WALL_FIXER_RESERVE
-                    and self.p.gold>=price+keep):
-                courier=self._courier_for(price,skip_item='WallFixer')
-                if courier:
-                    role,shop=courier
-                    self.m.jobs[role.unit_id]={'type':'order','item':'WallFixer',
-                        'price':price,'shop':shop,'keep':True}
-                    self.m.event(f'worker {role.unit_id}: reserve WallFixer ({stock+1}/{WALL_FIXER_RESERVE})')
-                    return
         # issue #3: 取消"首日金钱>100 优先买大机器人召唤令"的逻辑。
         # 前期金币优先用于武器升级 / 围墙升级 / 储备修复包；
         # 只有在武器升到2级以上、迎敌半圈围墙阶段完成、且进入第3天之后，
@@ -152,9 +158,14 @@ class Economy:
         # One purchasing courier at a time; the other worker keeps producing money.
         if any(j.get('type') in ('upgrade','order') for j in self.m.jobs.values()): return
         shops=[q for q,k in self.turn.zones.items() if k=='weaponShop']
+        # 当天配额预算保护: 每天先围墙(优先), 但围墙券只能用"超出武器配额预算"的闲钱,
+        # 否则 20 金的围墙券会一直把买武器券(100)的钱花掉, 武器永远升不上去。
+        weapon_reserve=WEAPON_VOUCHER_KEEP*self.weapon_quota_left()
         for priority,level,uid,item,target in self.options():
             price=self.p.shop_prices.get(item)
             if price is None or price>self.p.gold: continue
+            if item.startswith('Wall') and self.weapon_quota_left()>0:
+                if self.p.gold-price < weapon_reserve: continue
             # 第一天: 围墙是"用石头现场建"的，不得用采购额度抢武器升级的预算；
             # 武器升级券与保命项照常允许（需求3: 武器升级尽量在第一天完成）。
             day=self.m.day or ((self.turn.round_no-1)//130+1)
@@ -178,6 +189,24 @@ class Economy:
                     'level':level,'bought':False,'price':price,'shop':shop}
                 self.m.event(f'worker {role.unit_id}: purchase {item} for building {uid}')
                 return
+        # 修复包只在当天的围墙/武器升级配额都完成后, 用闲钱买
+        if self.wall_quota_left()==0 and self.weapon_quota_left()==0 \
+                and not any(j.get('type') in ('upgrade','order') for j in self.m.jobs.values()):
+            stock=sum(r.backpack.count('WallFixer') for r in self.turn.workers())
+            price=self.p.shop_prices.get('WallFixer')
+            if (self.turn.walls() and price is not None and stock<WALL_FIXER_RESERVE
+                    and self.p.gold>price):
+                courier=self._courier_for(price,skip_item='WallFixer')
+                if courier:
+                    role,shop=courier
+                    self.m.jobs[role.unit_id]={'type':'order','item':'WallFixer',
+                        'price':price,'shop':shop,'keep':True}
+                    self.m.event(f'worker {role.unit_id}: spare gold -> WallFixer ({stock+1})')
+                    return
+
+    def _nearest_shop(self,routes):
+        shops=[q for q,k in self.turn.zones.items() if k=='weaponShop']
+        return min(shops,key=routes.distance,default=None)
 
     def _courier_for(self,price,extra_slack=0,skip_item=None):
         """挑一名能负担"去商店->再回防"整段时间的工人做采购。
@@ -228,6 +257,58 @@ class Economy:
         """入夜前也必须完成的事: 召唤令采购/使用 + 升级券送达。"""
         return self.order(role,routes) or self.upgrade(role,routes)
 
+    def spend_ready(self,role,routes):
+        """是否到了"去商店把闲钱花掉再回家"的时点。
+
+        判据: 手上至少有 10 金, 且剩余回合刚好够"去商店 + 买 + 回家"。
+        这样不会因为回家触发太晚而白白把金币带回家。
+        """
+        if self.p.gold < SPEND_FIXER: return False
+        shop=self._nearest_shop(routes)
+        if shop is None: return False
+        stand=routes.adjacent(shop)
+        if stand is None: return False
+        trip=routes.cost[stand]+1+self.p.home_cost(role,stand)
+        return self.p.remaining <= trip+SPEND_TRIP_SLACK
+
+    def spend_before_home(self,role,routes):
+        """回家前尽量把闲钱花掉（升级券优先, 然后修复包）。
+
+        规则(用户给定): 30 元 -> 一张围墙升级券 + 一个修复包;
+        20 元 -> 一张围墙升级券; 10 元 -> 一个修复包。
+        前提是这趟商店往返仍能在第 75 回合死线前回到武器旁。
+        """
+        if role.backpack_full: return False
+        shop=self._nearest_shop(routes)
+        if shop is None: return False
+        gold=self.p.gold
+        price_fixer=self.p.shop_prices.get('WallFixer')
+        options=[]
+        # 选一件"买得起、且最值钱"的东西: 优先级 武器券 > 围墙券 > 修复包
+        for _,level,uid,item,target in self.options():
+            price=self.p.shop_prices.get(item)
+            if price is None or price>gold: continue
+            rank=0 if item.startswith('Weapon') else 1 if item.startswith('Wall') else 2
+            options.append((rank,-price,item,price))
+        if price_fixer is not None and price_fixer<=gold and self.turn.walls():
+            options.append((2,-price_fixer,'WallFixer',price_fixer))
+        if not options:
+            return False
+        options.sort()
+        item,price=options[0][2],options[0][3]
+        # 只在"去商店 + 买 + 回家"仍来得及的情况下绕路
+        stand=routes.adjacent(shop)
+        if stand is None: return False
+        cost=routes.cost[stand]+1+self.p.home_cost(role,stand)+SPEND_TRIP_SLACK
+        if cost>self.p.remaining and stand!=role.pos:
+            return False
+        if stand==role.pos:
+            self.p.commands[str(role.unit_id)]={'action':'buy','name':item,'num':1}
+            self.p.gold-=price
+            self.m.event(f'worker {role.unit_id}: spend-before-home buy {item}')
+            return True
+        return self.p.move(role,routes,stand)
+
     def harvest_near_home(self,role,routes):
         """需求3: 白天回防途中在家附近顺手采矿。
 
@@ -273,6 +354,9 @@ class Economy:
             if routes.distance(target.pos)==0:
                 self.p.interact(role,routes,target.pos,'use',name=job['item'],targetPos=[target.pos.dump()])
                 self.m.event(f'worker {role.unit_id}: use {job["item"]} on {target.unit_id}')
+                # 记录当天配额进度
+                if job['item'].startswith('Wall'): self.m.day_wall_upgrades += 1
+                elif job['item'].startswith('Weapon'): self.m.day_weapon_upgrades += 1
                 return True
             if self.turn.is_day and self.p.enough_time(role,routes,target.pos):
                 return self.p.interact(role,routes,target.pos,'use',name=job['item'],targetPos=[target.pos.dump()])

@@ -13,7 +13,8 @@ from .tasks import Tasks
 from .protocol import Pos, Turn, distance, station_footprint, move_command
 
 LOADOUT = ("rocket", "rocket", "railgun")
-RETURN_MARGIN = 5
+RETURN_MARGIN = 2          # 回到武器旁的少量安全余量
+RETURN_DEADLINE = 75       # 当天第75回合(含入夜前5回合)前必须回到武器塔旁; 夜间允许移动
 
 
 def ring(turn, radius):
@@ -76,7 +77,8 @@ class Planner:
         self.shop_prices = {x['name']: int(x['price']) for x in payload.get('weaponShopList', [])}
         self.walls = wall_sites(turn)
         self.home_cost_cache = {}
-        self.remaining = 70 - (turn.round_no - 1) % 130
+        # 可用回合预算到当天第 RETURN_DEADLINE 回合为止（含入夜 5 回合, 夜间可移动）
+        self.remaining = max(0, RETURN_DEADLINE - (turn.round_no - 1) % 130)
         self.economic = Economy(self)
 
     def route(self, role):
@@ -145,12 +147,18 @@ class Planner:
                             if self.memory.jobs.get(r.unit_id,{}).get('type')!='upgrade'),None)
         for role in workers:
             routes = self.route(role)
+            # 第一天: 先建完半圈围墙（用石头, 不走商店）, 之后才安排券的采购/送达
+            if self.memory.day==1 and self.missing_walls() and self.build_wall(role,routes):
+                continue
             # Using a voucher in place takes one turn and must not be suppressed
             # by the generic five-turn return margin.
             if self.economic.act_urgent(role,routes):
                 continue
+            # 回家前: 先判断是否该去商店把闲钱花掉（时机提前到"还够走一趟商店"）
+            if self.economic.spend_ready(role, routes) and self.economic.spend_before_home(role, routes):
+                continue
             if self.remaining <= self.home_cost(role, role.pos) + RETURN_MARGIN:
-                # 需求3: 回防途中在家附近顺手采矿（不耽误入夜前回位）
+                # 再顺手采家门口的矿, 最后回位
                 self.economic.harvest_near_home(role, routes)
                 continue
             if self.build_tower(role, routes):
@@ -202,7 +210,10 @@ class Planner:
         batch = min(3, (len(missing)+1)//2)
         # 采石分工: 只有被指派采石的工人去攒石头，另一名工人留给经济模块采矿石，
         # 避免"两人都去采石头"导致矿石收入为零（需求2）。
-        stone_fetcher = self.economic.family(role) == 'stone'
+        # 第一天必须在白昼内建完半圈围墙 -> 这一天两名工人都可以采石建墙;
+        # 第2天起严格按分工（一名采石、其余采矿）, 避免长期两人都去采石。
+        stone_fetcher = (self.economic.family(role) == 'stone'
+                         or (self.memory.day == 1 and bool(missing)))
         nearby = [p for p, kind in self.turn.zones.items()
                   if kind == 'stone' and distance(role.pos, p) <= 1
                   and not self.economic.blocked(p,kind)]

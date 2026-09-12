@@ -143,7 +143,7 @@ class HarvestOnTheWayHomeTests(unittest.TestCase):
             {'pos': {'x': 5, 'y': 24}, 'neutralType': 'vendor'},
             {'pos': {'x': 7, 'y': 24}, 'neutralType': 'weaponShop'},
         ])
-        p['roundNo'] = 66                      # 白天后段: remaining=5, 已进入返程窗口
+        p['roundNo'] = 70                      # 死线(第75回合)前夕: remaining=6
         p['teamOur']['roles'][1]['pos'] = {'x': 8, 'y': 26}   # 工人已在矿(8,25)旁
         return p, Pos.load(mine_pos)
 
@@ -171,7 +171,7 @@ class HarvestOnTheWayHomeTests(unittest.TestCase):
             {'pos': {'x': 10, 'y': 16}, 'neutralType': 'iron'},   # 距基地8格, 正对返程方向
             {'pos': {'x': 5, 'y': 24}, 'neutralType': 'vendor'},
         ])
-        p['roundNo'] = 60                    # 白昼后段(约60回合)进入返程窗口
+        p['roundNo'] = 62                    # remaining=13: 够 采一次+回家+缓冲
         p['teamOur']['roles'][1]['pos'] = {'x': 10, 'y': 17}      # 就在矿旁
         m = Memory(day=1)
         planner = Planner(Turn.load(p), p, m)
@@ -182,7 +182,7 @@ class HarvestOnTheWayHomeTests(unittest.TestCase):
 
     def test_no_harvest_when_time_would_run_out(self):
         p, _ = self.payload_with_home_mine(near=True)
-        p['roundNo'] = 69                      # remaining=2, 已无余量顺手采
+        p['roundNo'] = 74                      # remaining=2, 已无余量顺手采
         m = Memory(day=1)
         planner = Planner(Turn.load(p), p, m)
         role = [w for w in planner.turn.workers() if w.unit_id == 2][0]

@@ -167,13 +167,13 @@ class UpgradeOrderTests(unittest.TestCase):
         wall_pos = next(i for i, o in enumerate(options) if o[3].startswith('Wall'))
         self.assertLess(weapon_pos, wall_pos)
 
-    def test_day2_weapons_first_per_issue3(self):
-        # issue #3: 前期(day1-2) 金币优先武器升级，围墙券在其后
+    def test_every_day_walls_come_before_weapons(self):
+        # 新规则: 每天都是"先围墙配额, 再武器配额"
         planner, options = self.planned(day=2)
         self.assertTrue([o for o in options if o[3].startswith('Wall')], '存在待升级围墙')
-        weapon_pos = next(i for i, o in enumerate(options) if o[3].startswith('Weapon'))
         wall_pos = next(i for i, o in enumerate(options) if o[3].startswith('Wall'))
-        self.assertLess(weapon_pos, wall_pos, [o[3] for o in options])
+        weapon_pos = next(i for i, o in enumerate(options) if o[3].startswith('Weapon'))
+        self.assertLess(wall_pos, weapon_pos, [o[3] for o in options])
 
     def test_day3_onwards_wall_phase_first(self):
         planner, options = self.planned(day=3)
