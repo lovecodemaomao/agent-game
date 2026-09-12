@@ -4,6 +4,13 @@ from .geography import INF
 from .protocol import distance
 
 ORES=('stone','iron','copper')
+SUMMON_ORDER='LargeRobotSummonOrder'      # 大机器人召唤令(需求: 第一天金钱>100优先购买)
+SUMMON_ORDER_TRIGGER=100
+RETURN_MARGIN=5                           # 与 brain.RETURN_MARGIN 保持一致
+HARVEST_BUFFER=2                          # 顺手采集只留 2 回合缓冲（返程已在 margin 内）
+NEAR_HOME_RADIUS=4                        # "家附近"判定半径（基地切比雪夫距离）
+HARVEST_DETOUR=2                          # 顺路判据: 多绕不超过 2 回合即视为顺手
+NIGHT_OVERRUN=12                          # 首日召唤令专差允许延伸入夜的回合数
 HP={'station':(1500,3000,4500),'wall':(1000,1500,2000),
     'rocket':(1000,1500,2000),'railgun':(1000,1500,2000),'gatling':(1000,1500,2000)}
 
@@ -51,8 +58,13 @@ class Economy:
                     priority=1 if weapon_first else (3 if wall_phase else 1)
                 else:                      # railgun / gatling
                     priority=1.5 if weapon_first else (3.5 if wall_phase else 1.5)
-            # Favor forward, damaged walls rather than uniformly buying every wall.
-            priority += (0 if u.kind!='wall' else (0 if u.pos in self.p.walls else 2)+ratio*0.1)
+            # 围墙: 越朝向机器人越优先（self.p.walls 已按迎敌方向由前到后排序），
+            # 非迎敌半圈的墙排到最后；受损墙再略微提前（ratio 越小越靠前）。
+            if u.kind=='wall':
+                if u.pos in self.p.walls:
+                    priority += self.p.walls.index(u.pos)*0.05 + ratio*0.1
+                else:
+                    priority += 2 + ratio*0.1
             options.append((priority,level,u.unit_id,item,u))
         return sorted(options,key=lambda x:x[:3])
 
@@ -85,8 +97,24 @@ class Economy:
                     occupied.add(uid)
                     break
         if not self.turn.is_day or len(self.turn.weapons())<3: return
+        # 需求2: 第一天在买升级券之前，只要金钱超过100 就优先买大机器人召唤令
+        if (self.m.day<=1 and not self.m.summon_order_done
+                and SUMMON_ORDER in self.p.shop_prices
+                and self.p.gold>SUMMON_ORDER_TRIGGER
+                and not any(j.get('type')=='order' for j in self.m.jobs.values())
+                and not any(SUMMON_ORDER in r.backpack for r in self.turn.controllable())):
+            # 首日破百通常在白昼后段, 商店往返来不及但值得为 100 金骚扰道具
+            # 延伸入夜（首夜仅少量小型机器人, 且召唤令买到即用、无需带回）
+            courier=self._courier_for(self.p.shop_prices[SUMMON_ORDER],
+                                      extra_slack=NIGHT_OVERRUN)
+            if courier:
+                role,shop=courier
+                self.m.jobs[role.unit_id]={'type':'order','item':SUMMON_ORDER,
+                    'price':self.p.shop_prices[SUMMON_ORDER],'shop':shop}
+                self.m.event(f'worker {role.unit_id}: day-1 priority buy {SUMMON_ORDER}')
+                return
         # One purchasing courier at a time; the other worker keeps producing money.
-        if any(j.get('type')=='upgrade' for j in self.m.jobs.values()): return
+        if any(j.get('type') in ('upgrade','order') for j in self.m.jobs.values()): return
         shops=[q for q,k in self.turn.zones.items() if k=='weaponShop']
         for priority,level,uid,item,target in self.options():
             price=self.p.shop_prices.get(item)
@@ -114,6 +142,85 @@ class Economy:
                     'level':level,'bought':False,'price':price,'shop':shop}
                 self.m.event(f'worker {role.unit_id}: purchase {item} for building {uid}')
                 return
+
+    def _courier_for(self,price,extra_slack=0):
+        """挑一名能负担"去商店->再回防"整段时间的工人做采购。
+
+        extra_slack: 允许的额外回合余量（首日召唤令专差可延伸入夜, 见 NIGHT_OVERRUN）。
+        """
+        shops=[q for q,k in self.turn.zones.items() if k=='weaponShop']
+        best=None
+        for role in self.turn.workers():
+            if role.backpack_full: continue
+            routes=self.p.route(role)
+            for shop in shops:
+                stand=routes.adjacent(shop)
+                if stand is None: continue
+                cost=routes.cost[stand]+self.p.home_cost(role,stand)+2+RETURN_MARGIN
+                if cost<self.p.remaining+extra_slack and (best is None or cost<best[0]):
+                    best=(cost,role,shop)
+        return (best[1],best[2]) if best else None
+
+    def order(self,role,routes):
+        """召唤令采购/使用: 买到即用（使用不需要目标位置）。"""
+        job=self.m.jobs.get(role.unit_id)
+        if not job or job.get('type')!='order': return False
+        item=job['item']
+        if item in role.backpack:
+            self.p.commands[str(role.unit_id)]={'action':'use','name':item}
+            self.m.jobs.pop(role.unit_id,None)
+            self.m.summon_order_done=True
+            self.m.event(f'worker {role.unit_id}: use {item}')
+            return True
+        if not self.turn.is_day or job['price']>self.p.gold:
+            self.m.jobs.pop(role.unit_id,None)
+            return False
+        shop=job['shop']
+        if routes.distance(shop)>=INF:
+            self.m.jobs.pop(role.unit_id,None)
+            return False
+        if self.p.interact(role,routes,shop,'buy',name=item,num=1):
+            if routes.distance(shop)==0: self.p.gold-=job['price']
+            return True
+        return False
+
+    def act_urgent(self,role,routes):
+        """入夜前也必须完成的事: 召唤令采购/使用 + 升级券送达。"""
+        return self.order(role,routes) or self.upgrade(role,routes)
+
+    def harvest_near_home(self,role,routes):
+        """需求3: 白天回防途中在家附近顺手采矿。
+
+        只做"不耽误入夜前回到武器旁"的顺路采集：矿点必须在基地附近，
+        且 走到矿点 + 采一次 + 从矿点回位 + 返程余量 仍在白昼剩余回合内。
+        """
+        if role.backpack_full: return False
+        station=self.turn.station()
+        if station is None: return False
+        best=None
+        home_now=self.p.home_cost(role,role.pos)
+        for mine,kind in self.turn.zones.items():
+            price=self.p.prices.get(kind,0)
+            if kind not in ORES or price<=0 or self.blocked(mine,kind): continue
+            for seat in self.p.geo.seats(mine):
+                travel=routes.cost.get(seat,INF)
+                if travel>=INF: continue
+                home=self.p.home_cost(role,seat)
+                # "顺手"判据: 家附近 或 相对当前返程路线只多绕 HARVEST_DETOUR 回合内
+                # （矿点不会生成在基地建造区内, 单看半径往往永远不中）
+                detour=travel+1+home-home_now
+                if distance(mine,station.pos)>NEAR_HOME_RADIUS and detour>HARVEST_DETOUR:
+                    continue
+                if travel+1+home+HARVEST_BUFFER<=self.p.remaining:
+                    if best is None or travel<best[0]:
+                        best=(travel,mine,seat)
+        if best is None: return False
+        travel,mine,seat=best
+        if role.pos==seat:
+            self.p.commands[str(role.unit_id)]={'action':'collect','targetPos':[mine.dump()]}
+            self.m.event(f'worker {role.unit_id}: harvest {self.turn.zones[mine]} near home on the way back')
+            return True
+        return self.p.move(role,routes,seat)
 
     def upgrade(self,role,routes):
         job=self.m.jobs.get(role.unit_id)
@@ -248,6 +355,7 @@ class Economy:
         return self.p.move(role,routes,seat)
 
     def act(self,role,routes):
+        if self.order(role,routes): return True
         if self.upgrade(role,routes): return True
         job=self.m.jobs.get(role.unit_id)
         if job and job.get('type')=='sell':

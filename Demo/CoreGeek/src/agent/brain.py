@@ -147,9 +147,11 @@ class Planner:
             routes = self.route(role)
             # Using a voucher in place takes one turn and must not be suppressed
             # by the generic five-turn return margin.
-            if self.economic.upgrade(role,routes):
+            if self.economic.act_urgent(role,routes):
                 continue
             if self.remaining <= self.home_cost(role, role.pos) + RETURN_MARGIN:
+                # 需求3: 回防途中在家附近顺手采矿（不耽误入夜前回位）
+                self.economic.harvest_near_home(role, routes)
                 continue
             if self.build_tower(role, routes):
                 continue
