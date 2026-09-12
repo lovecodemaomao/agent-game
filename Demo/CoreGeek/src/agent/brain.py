@@ -163,7 +163,8 @@ class Planner:
                 continue
             if self.build_tower(role, routes):
                 continue
-            if (self.memory.day==1 or role.unit_id==maintenance) and self.build_wall(role,routes):
+            # 半圈围墙未完成 -> 两名工人一起把墙搭好; 搭好后只留维护工补墙
+            if (self.missing_walls() or role.unit_id==maintenance) and self.build_wall(role,routes):
                 continue
             self.economic.act(role,routes)
         self.assign_towers(day=True)
@@ -210,10 +211,10 @@ class Planner:
         batch = min(3, (len(missing)+1)//2)
         # 采石分工: 只有被指派采石的工人去攒石头，另一名工人留给经济模块采矿石，
         # 避免"两人都去采石头"导致矿石收入为零（需求2）。
-        # 第一天必须在白昼内建完半圈围墙 -> 这一天两名工人都可以采石建墙;
-        # 第2天起严格按分工（一名采石、其余采矿）, 避免长期两人都去采石。
+        # 半圈围墙没搭完之前, 两名工人都可以采石建墙（先把防线立起来）;
+        # 半圈搭好后不需要石头, 两人一起采矿（分工自然退化为全员采矿）。
         stone_fetcher = (self.economic.family(role) == 'stone'
-                         or (self.memory.day == 1 and bool(missing)))
+                         or bool(missing))
         nearby = [p for p, kind in self.turn.zones.items()
                   if kind == 'stone' and distance(role.pos, p) <= 1
                   and not self.economic.blocked(p,kind)]

@@ -112,7 +112,11 @@ class Tasks:
                        and self.turn.round_no <= old['start']+old['timeout']
                        and any(distance(self.pioneer.pos,q)<=1 for q in old['positions']))
             if success:
+                # 提取本次成功用到的命令与被接受的答案, 供同类任务直接复用(省探测+LLM往返)
+                last_cmd=next((h.get('command') for h in reversed(old['history']) if h.get('command')),None)
+                last_answer=next((h.get('answer') for h in reversed(old['history']) if h.get('answer')),None)
                 self.m.skills.append({'task':old['desc'][:4000], 'method':old.get('skill','')[:4000],
+                                      'command':last_cmd, 'answer':last_answer,
                                       'steps':old['history'][-6:]})
                 self.m.skills[:] = self.m.skills[-12:]
                 self.m.event('task completed; saved reusable procedure')
@@ -127,6 +131,24 @@ class Tasks:
                            'token':token,'positions':choice.get('positions',[]),
                            'history':[],'proposal':None,'waiting_cmd':False,'skill':'',
                            'probes':0,'probe_results':[],'probing':False}
+            # 同类任务快速通道: 题干结构一致(仅参数不同) -> 直接复用已验证的命令
+            reusable=self.reusable(desc)
+            if reusable:
+                self.m.task['reuse']=reusable
+                self.m.event('task matches a saved procedure; skip probing/LLM')
+
+    def reusable(self,desc):
+        """在已保存的 SOP 里找题干结构一致的条目(把数字/城市名等参数抽象掉再比)。"""
+        import re as _re
+        def norm(text):
+            text=_re.sub(r'[0-9]+','#',str(text or ''))
+            text=_re.sub(r'[\u4e00-\u9fa5]{2,4}(?=今天|的天气)','CITY',text)
+            return text[:400].strip()
+        key=norm(desc)
+        for entry in reversed(self.m.skills):
+            if entry.get('command') and norm(entry.get('task'))==key:
+                return entry
+        return None
 
     def run(self):
         self.sync_task()
@@ -197,8 +219,27 @@ class Tasks:
         # Preserve the task while reasoning, but do not sacrifice mandatory defense.
         deadline = task['start']+task['timeout']
         returning = (not self.turn.is_day or self.p.remaining <= self.p.home_cost(role,role.pos)+5)
+        # 快速通道: 同类任务直接重放已验证命令(零探测、零 LLM 往返)
+        if task.get('reuse') and not task['waiting_cmd'] and not returning:
+            entry=task['reuse']
+            if not task.get('reuse_done'):
+                task['reuse_done']=True
+                task['waiting_cmd']=True
+                task['history'].append({'command':entry['command']})
+                self.p.execute_cmd=entry['command']
+                self.m.event('task: replay saved procedure')
+                return True
+            result=str(self.payload.get('lastCmdResult') or '')
+            if result and entry.get('answer'):
+                answer=entry['answer']
+                self.p.commands[str(role.unit_id)]={'action':'submitAnswer','taskAnswer':answer}
+                task['history'].append({'answer':answer})
+                task['submitted']=True
+                task['reuse']=None
+                self.m.event('task: submitted saved answer')
+                return True
         # 阶段一: 固定探测（只探测任务目录，最多 PROBE_LIMIT 轮，不消耗 LLM 额度）
-        if task.get('probes',0) < PROBE_LIMIT and not returning and not task['waiting_cmd']:
+        if task.get('probes',0) < PROBE_LIMIT and not task['waiting_cmd'] and not returning:
             command = PROBES[task['probes']]
             task['probes'] += 1
             task['probing'] = True

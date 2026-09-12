@@ -23,6 +23,10 @@ DAY_PLAN_DEFAULT={'front_walls':4,'weapons':2}
 SPEND_WALL_VOUCHER=20                     # 回家前清钱: 围墙券价(参考)
 SPEND_FIXER=10                            # 回家前清钱: 修复包价
 SPEND_TRIP_SLACK=3                        # 清钱时点余量(回合)
+STATION_FALLBACK_HP=1000                  # 兜底: 撑过第3夜后基地低于该血量 -> 优先升级基地
+STATION_FALLBACK_DAY=4                    # 兜底生效的最早天数
+MIN_MINE_BATCH=8                          # 单趟至少采够的矿石数(避免采几块就回家)
+MIN_SELL_BATCH=6                          # 至少攒够这么多才值得跑一趟小贩
 WALL_FIXER_BUDGET_KEEP=20                 # 无武器升级需求时, 买修复包只保留的金币
 WEAPON_VOUCHER_KEEP=100                   # 仍有武器待升2级时, 为其保留的券价
 HP={'station':(1500,3000,4500),'wall':(1000,1500,2000),
@@ -84,7 +88,10 @@ class Economy:
             elif u.kind=='wall' and level==3:
                 if ratio>=0.7: continue
                 item='WallFixer'; priority=4
-            elif u.kind=='station' and ratio<0.6 and level<3:
+            elif (u.kind=='station' and level<3
+                  and ((ratio<0.6)
+                       or (self.m.day>=STATION_FALLBACK_DAY
+                           and u.health<STATION_FALLBACK_HP))):
                 item=f'StationUpgradeVoucher{level}'; priority=0
             else:
                 if level>=3: continue
@@ -185,9 +192,15 @@ class Economy:
                         choices.append((cost,role,shop))
             if choices:
                 _,role,shop=min(choices,key=lambda x:x[0])
+                # 批量采购: 同一种券一次买够(受当天配额与金币限制), 避免为同一件东西
+                # 反复跑商店 —— buy 动作支持 num。
+                need=(self.wall_quota_left() if item.startswith('Wall')
+                      else self.weapon_quota_left() if item.startswith('Weapon') else 1)
+                held=sum(r.backpack.count(item) for r in self.turn.controllable())
+                buy_n=max(1,min(max(1,need-held), int(self.p.gold//price)))
                 self.m.jobs[role.unit_id]={'type':'upgrade','unit':uid,'item':item,
-                    'level':level,'bought':False,'price':price,'shop':shop}
-                self.m.event(f'worker {role.unit_id}: purchase {item} for building {uid}')
+                    'level':level,'bought':False,'price':price,'shop':shop,'num':buy_n}
+                self.m.event(f'worker {role.unit_id}: purchase {buy_n}x {item} for building {uid}')
                 return
         # 修复包只在当天的围墙/武器升级配额都完成后, 用闲钱买
         if self.wall_quota_left()==0 and self.weapon_quota_left()==0 \
@@ -199,9 +212,10 @@ class Economy:
                 courier=self._courier_for(price,skip_item='WallFixer')
                 if courier:
                     role,shop=courier
+                    buy_n=max(1,min(WALL_FIXER_RESERVE-stock,int(self.p.gold//price)))
                     self.m.jobs[role.unit_id]={'type':'order','item':'WallFixer',
-                        'price':price,'shop':shop,'keep':True}
-                    self.m.event(f'worker {role.unit_id}: spare gold -> WallFixer ({stock+1})')
+                        'price':price,'shop':shop,'keep':True,'num':buy_n}
+                    self.m.event(f'worker {role.unit_id}: spare gold -> {buy_n}x WallFixer')
                     return
 
     def _nearest_shop(self,routes):
@@ -248,8 +262,9 @@ class Economy:
         if routes.distance(shop)>=INF:
             self.m.jobs.pop(role.unit_id,None)
             return False
-        if self.p.interact(role,routes,shop,'buy',name=item,num=1):
-            if routes.distance(shop)==0: self.p.gold-=job['price']
+        num=max(1,int(job.get('num',1)))
+        if self.p.interact(role,routes,shop,'buy',name=item,num=num):
+            if routes.distance(shop)==0: self.p.gold-=job['price']*num
             return True
         return False
 
@@ -369,8 +384,9 @@ class Economy:
         if job['price']>self.p.gold or role.backpack_full or routes.distance(shop)>=INF:
             self.m.jobs.pop(role.unit_id,None)
             return False
-        if self.p.interact(role,routes,shop,'buy',name=job['item'],num=1):
-            if routes.distance(shop)==0: self.p.gold-=job['price']
+        num=max(1,int(job.get('num',1)))
+        if self.p.interact(role,routes,shop,'buy',name=job['item'],num=num):
+            if routes.distance(shop)==0: self.p.gold-=job['price']*num
             return True
         return False
 
@@ -439,7 +455,10 @@ class Economy:
             price=self.p.prices.get(kind,0)
             if kind not in ORES or price<=0 or self.blocked(mine,kind): continue
             if kinds is not None and kind not in kinds: continue
-            quantity=min(capacity,max(1,10-self.m.mine_used.get(mine,0)-self.mine_claims[mine]))
+            # 一趟尽量采够(MIN_MINE_BATCH 起步, 受矿点剩余与背包容量限制)
+            left_in_mine=max(1,10-self.m.mine_used.get(mine,0)-self.mine_claims[mine])
+            quantity=min(capacity,left_in_mine)
+            quantity=min(capacity,max(quantity,min(MIN_MINE_BATCH,left_in_mine)))
             sales=len(set(stock)|{kind})
             for entry in self.p.geo.seats(mine):
                 approach=routes.cost.get(entry,INF)
@@ -516,6 +535,14 @@ class Economy:
         funding=next((self.p.shop_prices[item] for _,_,_,item,_ in self.options()
                       if item in self.p.shop_prices and self.p.shop_prices[item]>self.p.gold),None)
         unlock=funding is not None and self.p.gold+value>=funding
+        # 批量原则: 手上的矿没攒够 MIN_SELL_BATCH 且背包未满时不专程跑小贩,
+        # 除非正好差钱采购(funding)或已经顺路(vendor 就在旁边)。
+        stock_now=sum(1 for x in role.backpack if x in ORES)
+        near_vendor=any(distance(role.pos,v)<=1 for v in
+                        [q for q,k in self.turn.zones.items() if k=='vendor'])
+        if sale is not None and not role.backpack_full and not unlock and not near_vendor \
+                and stock_now<MIN_SELL_BATCH:
+            sale=None
         if sale and (mine is None or sale['score']>=mine['score'] or unlock):
             self.m.jobs[role.unit_id]={'type':'sell',**sale}
             return self.sell(role,routes,self.m.jobs[role.unit_id])
