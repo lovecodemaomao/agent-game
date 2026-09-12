@@ -12,7 +12,6 @@ It is never executed by this agent's host process.
 """
 import hashlib
 import json
-import re
 from collections import Counter
 from .protocol import Pos, distance
 from .geography import INF
@@ -20,119 +19,24 @@ from .geography import INF
 # 自进化任务目录与接口约定（赛事环境固定，禁止从 / 全盘递归）
 TASK_DIR = '/tmp/selfEvolutionTask/'
 HERITAGE_API_KEY = 'heritage-api-key-2024'
-FILE_RE = re.compile(r'[0-9A-Za-z_\-\u4e00-\u9fa5]+\.(?:md|txt|json|csv|py|ya?ml|log|ini|conf|toml)', re.I)
-
-
-def mentioned_files(text):
-    """从任务原文里抽取被提到的文件名(如 task_1_beijing.md)。"""
-    return sorted({m.group(0) for m in FILE_RE.finditer(str(text or ''))})
-
-
-def locate_command(files):
-    """第1轮: 自动定位任务提到的文件并打印内容; 未提到文件则列出任务目录。
-
-    取代原来"find -> cat -> grep"三轮手工探索: 一轮拿到文件+接口线索。
-    """
-    parts = []
-    for name in (files or [])[:4]:
-        base = name.split('/')[-1]
-        parts.append(
-            "f=$(find %s -maxdepth 4 -name '%s' 2>/dev/null | head -1); "
-            "if [ -n \"$f\" ]; then echo \"__FILE $f\"; cat \"$f\"; "
-            "else echo '__MISSING %s'; fi" % (TASK_DIR, base, base))
-    if not parts:
-        parts.append("echo '__TREE'; find %s -maxdepth 3 2>/dev/null | head -60" % TASK_DIR)
-    parts.append("echo '__HINTS'; grep -rInE 'https?://|X-API-Key|api[-_]?key|token|example|param' "
-                 "%s 2>/dev/null | head -20" % TASK_DIR)
-    return '; '.join(parts)
-
-
-def api_schedule_command():
-    """第2轮: 一轮内完成 "抽取接口信息 -> 探测可达 -> 枚举参数 -> 带鉴权调用"。
-
-    取代原来靠 LLM 逐个参数试错的多轮 curl 拼接。
-    """
-    script = r"""
-import re, glob, os, json, urllib.request, urllib.parse
-root = %r
-text = ''
-for p in glob.glob(root + '**/*', recursive=True):
-    if os.path.isfile(p) and os.path.getsize(p) < 200000:
-        try:
-            text += open(p, encoding='utf-8', errors='ignore').read() + '\n'
-        except Exception:
-            pass
-urls = sorted(set(re.findall(r'https?://[0-9A-Za-z\.\-]+(?::\d+)?', text)))
-keys = re.findall(r'(X-API-Key|Authorization|api[_-]?key)\s*[:：]?\s*([A-Za-z0-9\-_]{6,})', text, re.I)
-hdr = (keys[0][0], keys[0][1]) if keys else ('X-API-Key', %r)
-params = sorted(set(re.findall(r'[?&]([A-Za-z_][A-Za-z0-9_]{1,20})=', text)))
-print('__API_EXTRACT urls=%%s hdr=%%s params=%%s' %% (urls[:3], hdr, params[:5]))
-base = ''
-for u in urls[:3]:
-    try:
-        req = urllib.request.Request(u, headers={hdr[0]: hdr[1]})
-        print('__API status=%%s base=%%s' %% (urllib.request.urlopen(req, timeout=8).getcode(), u))
-        base = base or u
-    except Exception as e:
-        print('__API status=ERR base=%%s err=%%s' %% (u, type(e).__name__))
-vals = sorted({v for v in re.findall(r'\b\d{1,4}\b', text)})[:15]
-print('__API_DIST id(%%d distinct)' %% len(vals))
-if base and params:
-    name = params[0]
-    for v in (vals[:6] or ['']):
-        url = base if not v else base + ('&' if '?' in base else '?') + name + '=' + urllib.parse.quote(v)
-        try:
-            req = urllib.request.Request(url, headers={hdr[0]: hdr[1]})
-            body = urllib.request.urlopen(req, timeout=8).read().decode('utf-8', 'replace')[:2000]
-            print('__API_CALL %%s -> %%s' %% (url, body))
-        except Exception as e:
-            print('__API_CALL ERR %%s %%s' %% (url, type(e).__name__))
-print('__API_DONE')
-""" % (TASK_DIR, HERITAGE_API_KEY)
-    return "python3 - <<'PY'\n" + script.strip() + "\nPY"
-
-
-def probes_for(desc):
-    """按任务原文生成两轮富探测命令(自动定位 -> API 自动调度)。"""
-    return (locate_command(mentioned_files(desc)), api_schedule_command())
-
-
-PROBE_LIMIT = 2
+PROBES = (
+    # 第1轮: 只看任务目录结构
+    "find %s -maxdepth 3 2>/dev/null | head -80" % TASK_DIR,
+    # 第2轮: 打印目录内文本文件内容（限深、限大小、带文件名分隔）
+    ("find %s -maxdepth 3 -type f -size -64k 2>/dev/null | head -20 | "
+     "while read f; do echo \"===== $f =====\"; cat \"$f\"; done | head -400" % TASK_DIR),
+    # 第3轮: 抽取接口/参数线索
+    ("grep -rInE 'http|api|key|token|param|curl|POST|GET|json' %s 2>/dev/null | head -60"
+     % TASK_DIR),
+)
+PROBE_LIMIT = len(PROBES)
 
 
 def task_param(text):
-    """抽取任务参数(题干里的城市名, 或文件名里的可区分片段)。
-
-    用于复用已验证方法时的参数替换: task_1_beijing.md -> beijing。
-    """
-    text=str(text or '')
-    m=re.search(r'(?:查询|获取)([^\s,。，]{1,12}?)(?:今天|明天|当天|的天气)', text)
-    if m: return m.group(1).strip()
-    files=mentioned_files(text)
-    if files:
-        stem=files[0].split('/')[-1].rsplit('.',1)[0]
-        parts=[q for q in re.split(r'[_\-\s]+', stem) if q and not q.isdigit()]
-        if parts: return parts[-1]
-    return ''
-
-def task_facts(history):
-    """从探测/调用历史里抽取可复用事实(kind/base/param/header/取值集合)。"""
-    blob='\n'.join(str(h.get('result') or h.get('command') or '') for h in (history or []))
-    facts={'kind':'llm'}
-    m=re.search(r'__API_EXTRACT urls=\[(.*?)\] hdr=\((.*?)\) params=\[(.*?)\]', blob)
-    if m:
-        facts['kind']='api'
-        facts['urls']=[u.strip().strip("'\"") for u in m.group(1).split(',') if u.strip()]
-        facts['base']=facts['urls'][0] if facts['urls'] else ''
-        facts['header']=m.group(2).strip()
-        facts['params']=[p.strip().strip("'\"") for p in m.group(3).split(',') if p.strip()]
-    d=re.search(r'__API_DIST \w+\((\d+) distinct\)', blob)
-    if d: facts['distinct_values']=int(d.group(1))
-    if '__FILE ' in blob and facts['kind']=='llm':
-        facts['kind']='file'
-    f=re.search(r'__FILE (\S+)', blob)
-    if f: facts['file']=f.group(1)
-    return facts
+    """抽取任务参数(如"查询XX今天的天气"里的城市名), 用于复用时的命令参数替换。"""
+    import re as _re
+    m=_re.search(r'(?:查询|获取)([^\s,。，]{1,12}?)(?:今天|明天|当天|的天气)', str(text or ''))
+    return m.group(1).strip() if m else ''
 
 def parse_json(text):
     text = str(text or '').strip()
@@ -217,11 +121,9 @@ class Tasks:
                 # 提取本次成功用到的命令与被接受的答案, 供同类任务直接复用(省探测+LLM往返)
                 last_cmd=next((h.get('command') for h in reversed(old['history']) if h.get('command')),None)
                 last_answer=next((h.get('answer') for h in reversed(old['history']) if h.get('answer')),None)
-                facts=task_facts(old['history'])
                 self.m.skills.append({'task':old['desc'][:4000], 'method':old.get('skill','')[:4000],
                                       'command':last_cmd, 'answer':last_answer,
                                       'param':task_param(old['desc']),
-                                      'kind':facts['kind'], 'facts':facts,
                                       'steps':old['history'][-6:]})
                 self.m.skills[:] = self.m.skills[-12:]
                 self.m.event('task completed; saved reusable procedure')
@@ -246,9 +148,7 @@ class Tasks:
         """在已保存的 SOP 里找题干结构一致的条目(把数字/城市名等参数抽象掉再比)。"""
         import re as _re
         def norm(text):
-            text=str(text or '')
-            text=_re.sub(r'\S+\.(?:md|txt|json|csv|py|ya?ml|log|ini|conf|toml)','FILE',text,flags=re.I)
-            text=_re.sub(r'[0-9]+','#',text)
+            text=_re.sub(r'[0-9]+','#',str(text or ''))
             text=_re.sub(r'[\u4e00-\u9fa5]{2,4}(?=今天|的天气)','CITY',text)
             return text[:400].strip()
         key=norm(desc)
@@ -336,20 +236,7 @@ class Tasks:
                 now=task_param(task['desc'])
                 command=entry['command']
                 same=saved and now and saved==now
-                facts=entry.get('facts') or {}
-                if facts.get('kind')=='api' and facts.get('base') and facts.get('params') and now \
-                        and not same:
-                    # 技能事实库命中: 直接用记录的 base/鉴权头/参数名构造调用,
-                    # 无需再走"定位文件"那一轮
-                    hdr=facts.get('header') or ''
-                    hname,_,hval=(hdr.partition('=') if '=' in hdr else (hdr,'',HERITAGE_API_KEY))
-                    hname=(hname or 'X-API-Key').strip().strip("'\"")
-                    hval=(hval or HERITAGE_API_KEY).strip().strip("'\"")
-                    command=('curl -s -H "%s: %s" "%s%s%s=%s"'
-                             % (hname, hval, facts['base'],
-                                '&' if '?' in facts['base'] else '?',
-                                facts['params'][0], now))
-                elif saved and now and not same:
+                if saved and now and not same:
                     # 参数不同: 把旧参数替换成新参数后重跑, 不能沿用旧结果/旧答案
                     command=command.replace(saved, now)
                 task['reuse_same']=bool(same)
@@ -378,16 +265,15 @@ class Tasks:
                     '禁止编造结果中不存在的信息。')
             self.send('task',prompt,task['token'])
             return True
-        # 阶段一: 自动探测（第1轮自动定位文件, 第2轮API自动调度; 不消耗 LLM 额度）
+        # 阶段一: 固定探测（只探测任务目录，最多 PROBE_LIMIT 轮，不消耗 LLM 额度）
         if task.get('probes',0) < PROBE_LIMIT and not task['waiting_cmd'] and not returning:
-            plan = probes_for(task['desc'])
-            command = plan[task['probes']]
+            command = PROBES[task['probes']]
             task['probes'] += 1
             task['probing'] = True
             task['waiting_cmd'] = True
             task['history'].append({'command':command})
             self.p.execute_cmd = command
-            self.m.event(f'task auto-probe {task["probes"]}/{PROBE_LIMIT}')
+            self.m.event(f'task probe {task["probes"]}/{PROBE_LIMIT}')
             return True
         if proposal:
             if isinstance(proposal.get('skill'),str):

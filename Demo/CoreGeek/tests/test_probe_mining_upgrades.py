@@ -16,8 +16,7 @@ from test_strategy import fixture, unit
 from agent.brain import Planner, decide_response, wall_sites
 from agent.memory import Memory
 from agent.protocol import Turn, Pos, distance
-from agent.tasks import (mentioned_files, locate_command, api_schedule_command,
-                         PROBE_LIMIT, HERITAGE_API_KEY, TASK_DIR)
+from agent.tasks import PROBES, PROBE_LIMIT, HERITAGE_API_KEY, TASK_DIR
 
 
 def task_payload():
@@ -53,38 +52,24 @@ def two_worker_payload(day=1, gold=200, zones=None):
 
 
 class ProbeTests(unittest.TestCase):
-    def test_probe1_auto_locates_mentioned_files(self):
-        desc = '【自进化任务】请阅读 task_1_beijing.md 并按文件中的接口作答'
-        files = mentioned_files(desc)
-        self.assertIn('task_1_beijing.md', files, files)
-        cmd = locate_command(files)
-        self.assertIn(TASK_DIR, cmd)                 # 只探测任务目录
-        self.assertIn('task_1_beijing.md', cmd)      # 自动定位任务提到的文件
-        self.assertIn('cat', cmd)                    # 直接打印内容(省掉单独一轮 cat)
-        self.assertNotIn('find / ', cmd)             # 不做从根目录全盘递归
+    def test_first_probe_targets_task_dir_without_root_recursion(self):
+        probe = PROBES[0]
+        self.assertIn('find', probe)
+        self.assertIn(TASK_DIR, probe)
+        # 禁止从根目录全盘递归（会拖爆 15 秒沙盒限制）
+        self.assertNotIn('find / ', probe)
+        self.assertNotIn("find / ", PROBES[1])
+        for probe in PROBES:
+            self.assertIn(TASK_DIR, probe)
+            self.assertNotIn("-maxdepth 99", probe)
 
-    def test_probe1_without_files_lists_task_dir(self):
-        cmd = locate_command(mentioned_files('这是一个没有提到文件的抽象任务'))
-        self.assertIn(TASK_DIR, cmd)
-        self.assertIn('__TREE', cmd)
-
-    def test_probe2_api_scheduling_is_single_round(self):
-        cmd = api_schedule_command()
-        for marker in ('__API_EXTRACT', '__API status=', '__API_DIST', '__API_CALL', '__API_DONE'):
-            self.assertIn(marker, cmd)
-        self.assertIn(HERITAGE_API_KEY, cmd)         # 默认带上赛事鉴权头
-        self.assertIn('X-API-Key', cmd)
-
-    def test_two_rich_probes_replace_three_blind_ones(self):
-        self.assertEqual(PROBE_LIMIT, 2)
-
-    def test_probes_then_knowledge_prompt(self):
+    def test_three_fixed_probes_then_knowledge_prompt(self):
         p = task_payload()
-        p['phaseTask'] = '【自进化任务】请读取 task_2_shanghai.md 并调用其中接口作答'
+        p['phaseTask'] = '【自进化任务】调用遗产接口查询文物编号'
         m = Memory()
         rounds = []
         n = 1
-        for _ in range(6):
+        for _ in range(10):
             p['roundNo'] = n
             r = decide_response(p, m)
             if r['prompt']:
@@ -92,16 +77,18 @@ class ProbeTests(unittest.TestCase):
                 break
             self.assertTrue(r['executeCmd'], r)
             rounds.append(('probe', r['executeCmd']))
-            p['lastCmdResult'] = '[exitCode:0]\n__FILE /tmp/selfEvolutionTask/task_2_shanghai.md\napi=http://x/y'
+            p['lastCmdResult'] = '[exitCode:0]\nfile: task.txt api=http://127.0.0.1:9/heritage'
             n += 1
         probes = [c for kind, c in rounds if kind == 'probe']
         self.assertEqual(len(probes), PROBE_LIMIT, probes)
-        self.assertIn(TASK_DIR, probes[0])            # 第1轮: 自动定位
-        self.assertIn('__API', probes[1])             # 第2轮: API 自动调度
+        self.assertEqual(probes, list(PROBES))
         prompt = rounds[-1][1]
+        # 知识型 prompt: 带上前 3 轮探测结果, 并要求带鉴权头的 API 调用
         self.assertIn('probe_results', prompt)
         self.assertIn(HERITAGE_API_KEY, prompt)
-        self.assertEqual(m.llm_used, 0)               # 任务期不占每日额度
+        self.assertIn('curl', prompt)
+        self.assertIn('参数组合', prompt)
+        self.assertEqual(m.llm_used, 0)      # 任务期不占每日额度
 
     def test_probe_output_forwarded_to_llm(self):
         p = task_payload()
@@ -111,6 +98,7 @@ class ProbeTests(unittest.TestCase):
         for _ in range(PROBE_LIMIT):
             p['roundNo'] = n
             decide_response(p, m)
+            self.assertIn('selfEvolutionTask', m.task['history'][-1]['command'])
             p['lastCmdResult'] = '[exitCode:0]\nUNIQUE_PROBE_MARKER_%d' % n
             n += 1
         p['roundNo'] = n
