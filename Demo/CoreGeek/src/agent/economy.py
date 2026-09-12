@@ -25,6 +25,9 @@ SPEND_FIXER=10                            # 回家前清钱: 修复包价
 SPEND_TRIP_SLACK=3                        # 清钱时点余量(回合)
 STATION_FALLBACK_HP=1000                  # 兜底: 撑过第3夜后基地低于该血量 -> 优先升级基地
 STATION_FALLBACK_DAY=4                    # 兜底生效的最早天数
+FRONT_REPAIR_RATIO=0.7                    # 面向机器人的前排墙: 血量低于该比例即主动修复
+ANY_REPAIR_RATIO=0.5                      # 其余围墙: 低于该比例即修复
+CRITICAL_REPAIR_RATIO=0.25                # 濒临被打爆: 即使要现买修复包也优先于升级
 MIN_MINE_BATCH=8                          # 单趟至少采够的矿石数(避免采几块就回家)
 MIN_SELL_BATCH=6                          # 至少攒够这么多才值得跑一趟小贩
 WALL_FIXER_BUDGET_KEEP=20                 # 无武器升级需求时, 买修复包只保留的金币
@@ -40,6 +43,15 @@ class Economy:
 
     def plan(self):
         return DAY_PLAN.get(self.m.day or ((self.turn.round_no-1)//130+1), DAY_PLAN_DEFAULT)
+
+    def damaged_walls(self):
+        """低于修复阈值的围墙（面向机器人的前排墙阈值更宽松）。"""
+        out=[]
+        for w in self.turn.walls():
+            level=max(1,min(3,w.level)); ratio=w.health/HP['wall'][level-1]
+            thr=FRONT_REPAIR_RATIO if w.pos in self.p.walls else ANY_REPAIR_RATIO
+            if ratio<thr: out.append(w)
+        return out
 
     def wall_quota_left(self):
         """当天还需完成的围墙升级数量（没有可升级的围墙时视为已完成）。"""
@@ -80,14 +92,17 @@ class Economy:
             if u is None: continue
             level=max(1,min(3,u.level)); ratio=u.health/HP[u.kind][level-1]
             held_fixer=any('WallFixer' in r.backpack for r in self.turn.controllable())
-            if u.kind=='wall' and ratio<0.5 and (level>=3 or held_fixer):
-                # issue #3: 围墙血量<50% 且手上有 WallFixer（或已满级无法用升级券回血）
-                # -> 立即修复，最高优先级；面向机器人的前排墙优先。
-                # 低等级墙且无修复包时不走这里: 升级券升级同样回满血且更划算。
-                item='WallFixer'; priority=0
+            front = u.kind=='wall' and u.pos in self.p.walls
+            # 主动防御修复: 面向机器人的前排墙血量<70% 即修(不等被打爆), 其余墙<50% 才修;
+            # 手上已有修复包 -> 最高优先级(不花金币); 需现买则排在武器/围墙升级之后。
+            if u.kind=='wall' and ratio < (FRONT_REPAIR_RATIO if front else ANY_REPAIR_RATIO) \
+                    and (level>=3 or held_fixer):
+                # 手上没修复包时按严重度: 濒临被打爆(<25%)优先于武器升级, 否则排在升级之后
+                item='WallFixer'
+                priority = 0 if held_fixer else (0.3 if ratio<CRITICAL_REPAIR_RATIO else 2.6)
             elif u.kind=='wall' and level==3:
-                if ratio>=0.7: continue
-                item='WallFixer'; priority=4
+                if ratio>=FRONT_REPAIR_RATIO: continue
+                item='WallFixer'; priority=4 if held_fixer else 4.5
             elif (u.kind=='station' and level<3
                   and ((ratio<0.6)
                        or (self.m.day>=STATION_FALLBACK_DAY
@@ -97,13 +112,16 @@ class Economy:
                 if level>=3: continue
                 prefix='Station' if u.kind=='station' else 'Wall' if u.kind=='wall' else 'Weapon'
                 item=f'{prefix}UpgradeVoucher{level}'
-                if u.kind=='wall':
-                    # 每天先围墙: 配额内的前挡升2级最优先(位序按弧线前排加权)
-                    priority = 1 if (level==1 and wall_quota) else 3
-                elif u.kind=='rocket':
-                    priority = 1.5 if weapon_quota else (2.5 if level==1 else 3)
-                else:                      # railgun / gatling
-                    priority = 1.8 if weapon_quota else (2.8 if level==1 else 3.2)
+                if u.kind=='rocket':
+                    # 武器升级优先级最高: 趁前期金币充裕尽快升到满级(3级)
+                    priority = 0.5 if level==1 else 0.6
+                elif u.kind in ('railgun','gatling'):
+                    priority = 0.8 if level==1 else 0.9
+                elif u.kind=='wall':
+                    # 武器升级优先于围墙升级(武器要尽快满级)
+                    priority = 1.2 if (level==1 and wall_quota) else (2.0 if level==1 else 2.4)
+                else:                      # station 常规升级(未到濒危/兜底条件)
+                    priority = 2.2 if level==1 else 2.6
             # 围墙: 越朝向机器人越优先（self.p.walls 已按迎敌方向由前到后排序），
             # 非迎敌半圈的墙排到最后；受损墙再略微提前（ratio 越小越靠前）。
             if u.kind=='wall':
@@ -165,13 +183,19 @@ class Economy:
         # One purchasing courier at a time; the other worker keeps producing money.
         if any(j.get('type') in ('upgrade','order') for j in self.m.jobs.values()): return
         shops=[q for q,k in self.turn.zones.items() if k=='weaponShop']
-        # 当天配额预算保护: 每天先围墙(优先), 但围墙券只能用"超出武器配额预算"的闲钱,
-        # 否则 20 金的围墙券会一直把买武器券(100)的钱花掉, 武器永远升不上去。
-        weapon_reserve=WEAPON_VOUCHER_KEEP*self.weapon_quota_left()
+        # 武器升级优先级最高(尽快升满): 在还有武器未满级时, 为"下一张武器券"保留金币,
+        # 围墙券只能用超出的闲钱 —— 否则 20 金的围墙券会把买武器券(100/150)的钱花光。
+        weapon_reserve=0
+        for w in self.turn.weapons():
+            lv=max(1,min(3,w.level))
+            if lv<3:
+                need='WeaponUpgradeVoucher%d'%lv
+                weapon_reserve=max(weapon_reserve,int(self.p.shop_prices.get(need,0)))
+
         for priority,level,uid,item,target in self.options():
             price=self.p.shop_prices.get(item)
             if price is None or price>self.p.gold: continue
-            if item.startswith('Wall') and self.weapon_quota_left()>0:
+            if item.startswith('Wall') and weapon_reserve>0:
                 if self.p.gold-price < weapon_reserve: continue
             # 第一天: 围墙是"用石头现场建"的，不得用采购额度抢武器升级的预算；
             # 武器升级券与保命项照常允许（需求3: 武器升级尽量在第一天完成）。
@@ -207,12 +231,14 @@ class Economy:
                 and not any(j.get('type') in ('upgrade','order') for j in self.m.jobs.values()):
             stock=sum(r.backpack.count('WallFixer') for r in self.turn.workers())
             price=self.p.shop_prices.get('WallFixer')
-            if (self.turn.walls() and price is not None and stock<WALL_FIXER_RESERVE
+            damaged=len(self.damaged_walls())
+            target=min(WALL_FIXER_RESERVE, max(2, damaged)) if damaged else WALL_FIXER_RESERVE
+            if (self.turn.walls() and price is not None and stock<target
                     and self.p.gold>price):
                 courier=self._courier_for(price,skip_item='WallFixer')
                 if courier:
                     role,shop=courier
-                    buy_n=max(1,min(WALL_FIXER_RESERVE-stock,int(self.p.gold//price)))
+                    buy_n=max(1,min(target-stock,int(self.p.gold//price)))
                     self.m.jobs[role.unit_id]={'type':'order','item':'WallFixer',
                         'price':price,'shop':shop,'keep':True,'num':buy_n}
                     self.m.event(f'worker {role.unit_id}: spare gold -> {buy_n}x WallFixer')

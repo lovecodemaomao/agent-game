@@ -32,6 +32,12 @@ PROBES = (
 PROBE_LIMIT = len(PROBES)
 
 
+def task_param(text):
+    """抽取任务参数(如"查询XX今天的天气"里的城市名), 用于复用时的命令参数替换。"""
+    import re as _re
+    m=_re.search(r'(?:查询|获取)([^\s,。，]{1,12}?)(?:今天|明天|当天|的天气)', str(text or ''))
+    return m.group(1).strip() if m else ''
+
 def parse_json(text):
     text = str(text or '').strip()
     if text.startswith('```'):
@@ -117,6 +123,7 @@ class Tasks:
                 last_answer=next((h.get('answer') for h in reversed(old['history']) if h.get('answer')),None)
                 self.m.skills.append({'task':old['desc'][:4000], 'method':old.get('skill','')[:4000],
                                       'command':last_cmd, 'answer':last_answer,
+                                      'param':task_param(old['desc']),
                                       'steps':old['history'][-6:]})
                 self.m.skills[:] = self.m.skills[-12:]
                 self.m.event('task completed; saved reusable procedure')
@@ -225,12 +232,23 @@ class Tasks:
             if not task.get('reuse_done'):
                 task['reuse_done']=True
                 task['waiting_cmd']=True
-                task['history'].append({'command':entry['command']})
-                self.p.execute_cmd=entry['command']
-                self.m.event('task: replay saved procedure')
+                saved=entry.get('param') or ''
+                now=task_param(task['desc'])
+                command=entry['command']
+                same=saved and now and saved==now
+                if saved and now and not same:
+                    # 参数不同: 把旧参数替换成新参数后重跑, 不能沿用旧结果/旧答案
+                    command=command.replace(saved, now)
+                task['reuse_same']=bool(same)
+                task['history'].append({'command':command})
+                self.p.execute_cmd=command
+                self.m.event('task: replay saved procedure (%s)' % ('same params' if same else 'params substituted'))
                 return True
             result=str(self.payload.get('lastCmdResult') or '')
-            if result and entry.get('answer'):
+            if not result:
+                return False
+            if task.get('reuse_same') and entry.get('answer'):
+                # 完全同题: 直接提交已验证答案(零 LLM)
                 answer=entry['answer']
                 self.p.commands[str(role.unit_id)]={'action':'submitAnswer','taskAnswer':answer}
                 task['history'].append({'answer':answer})
@@ -238,6 +256,15 @@ class Tasks:
                 task['reuse']=None
                 self.m.event('task: submitted saved answer')
                 return True
+            # 参数已变: 用新结果请 LLM 给出答案(省掉 3 轮探测, 不做无依据作答)
+            task['reuse']=None
+            self.p.history_note=result[:20000]
+            task['history'].append({'result':result[:20000]})
+            prompt=('沙盒命令已返回结果, 请据此给出任务答案, 只返回JSON对象: '
+                    '{"request_id":"原样回传","kind":"answer","answer":"答案","skill":"可复用方法"}。'
+                    '禁止编造结果中不存在的信息。')
+            self.send('task',prompt,task['token'])
+            return True
         # 阶段一: 固定探测（只探测任务目录，最多 PROBE_LIMIT 轮，不消耗 LLM 额度）
         if task.get('probes',0) < PROBE_LIMIT and not task['waiting_cmd'] and not returning:
             command = PROBES[task['probes']]
