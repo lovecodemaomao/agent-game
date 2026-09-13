@@ -51,7 +51,7 @@ class RingFirstTests(unittest.TestCase):
         planner = Planner(Turn.load(p), p, m)
         workers = sorted(planner.turn.workers(), key=lambda r: r.unit_id)
         # 两人都被允许去采石(second worker 也 stone_fetcher)
-        self.assertTrue(all(planner.economic.family(w) == 'stone' or True for w in workers))
+        self.assertTrue(all(planner.economic.family(w) == 'stone' for w in workers))
         fetched = []
         for w in workers:
             routes = planner.route(w)
