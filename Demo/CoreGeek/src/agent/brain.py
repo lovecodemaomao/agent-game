@@ -12,6 +12,7 @@ from .economy import Economy
 from .tasks import Tasks
 from .protocol import Pos, Turn, distance, station_footprint, move_command
 from .economy import DAY1_ORE_PHASE_ROUNDS
+from .fire_control import plan_fire, select_targets, shot_damage, threat, on_segment
 
 LOADOUT = ("rocket", "rocket", "rocket")   # 要求: 75 金币开局买三座火箭炮
 RETURN_MARGIN = 2          # 回到武器旁的少量安全余量
@@ -189,6 +190,12 @@ class Planner:
                 self.home_cost(role, stand) + RETURN_MARGIN < self.remaining)
 
     def run(self):
+        if not self.turn.is_day:
+            tasks = Tasks(self)
+            tasks.sync_task()
+            tasks.receive()
+            self.night()
+            return self.commands
         if self.payload.get('phaseTask'):
             self.engaged.update(r.unit_id for r in self.turn.alive(('pioneer',)))
         self.economic.prepare()
@@ -206,9 +213,6 @@ class Planner:
         if self.payload.get('phaseTask'):
             self.engaged.difference_update(r.unit_id for r in self.turn.alive(('pioneer',)))
         Tasks(self).run()
-        if not self.turn.is_day:
-            self.night()
-            return self.commands
         workers = self.turn.workers()
         maintenance = next((r.unit_id for r in workers
                             if self.memory.jobs.get(r.unit_id,{}).get('type')!='upgrade'),None)
@@ -367,18 +371,21 @@ class Planner:
         if not roles or not towers:
             return []
         paths = {r.unit_id: self.route(r) for r in roles}
-        count = min(len(roles), len(towers))
-        best, best_cost = [], float('inf')
-        for chosen in combinations(roles, count):
-            for fleet in permutations(towers, count):
-                cost = sum(paths[r.unit_id].distance(t.pos) for r, t in zip(chosen, fleet))
-                # Keep an existing post unless switching saves a meaningful trip.
-                cost += sum(3 for r, t in zip(chosen, fleet)
-                            if self.memory.tower_assignments.get(r.unit_id, t.unit_id) != t.unit_id)
-                # When undermanned, prefer rockets at equal walking cost.
-                cost += sum(t.kind != 'rocket' for t in fleet) * 0.1
-                if cost < best_cost:
-                    best_cost, best = cost, list(zip(chosen, fleet))
+        best, best_cost = [], None
+        for count in range(min(len(roles), len(towers)), 0, -1):
+            for chosen in combinations(roles, count):
+                for fleet in permutations(towers, count):
+                    distances = [paths[r.unit_id].distance(t.pos) for r,t in zip(chosen,fleet)]
+                    if any(d >= 10**6 for d in distances):
+                        continue
+                    switching = sum(3 for r,t in zip(chosen,fleet)
+                                    if self.memory.tower_assignments.get(r.unit_id,t.unit_id) != t.unit_id)
+                    cost = (-sum(d == 0 for d in distances), sum(distances)+switching,
+                            sum(t.kind != 'rocket' for t in fleet))
+                    if best_cost is None or cost < best_cost:
+                        best_cost, best = cost, list(zip(chosen, fleet))
+            if best:
+                break
         ready = []
         for role, tower in best:
             routes = self.route(role)
@@ -392,106 +399,23 @@ class Planner:
         return ready
 
     def night(self):
-        # issue #3: 夜间同样每回合检查围墙血量，低于50%且手上持有 WallFixer
-        # 立即修复（只做"已经在墙边"的即时修复，不为修墙长途走动而放弃操炮）。
+        # Defense owns all available operators at night. No delivery trip may
+        # remove a controller; cooldown/idle turns may use items in place only.
         self.economic.prepare()
-        for role in self.turn.workers():
-            if role.unit_id in self.engaged:
-                continue
-            if self.economic.upgrade(role, self.route(role)):
-                self.engaged.add(role.unit_id)
         ready = self.assign_towers()
-        remaining = {r.robot_id: r.health for r in self.turn.robots if r.health > 0}
-        for role, tower in sorted(ready, key=lambda pair: pair[1].kind != 'rocket'):
-            if tower.cooldown > 0:
-                if self.economic.upgrade(role,self.route(role)):
-                    continue
-                if 'Medicine' in role.backpack and role.health < 100:
-                    self.commands[str(role.unit_id)] = {'action': 'use', 'name': 'Medicine'}
-                continue
-            targets = select_targets(self.turn, tower, remaining)
+        plan, _ = plan_fire(self.turn, [tower for _,tower in ready])
+        serviced = set()
+        for role, tower in ready:
+            targets = plan.get(tower.unit_id)
             if targets:
                 self.commands[str(tower.unit_id)] = {'action': 'attack', 'controllerId': str(role.unit_id),
                                                      'targetPos': [p.dump() for p in targets]}
-
-
-def threat(turn, robot):
-    station = turn.station()
-    d = min(distance(robot.pos, p) for p in station_footprint(station.pos))
-    own = 1.0 if not robot.target_team or robot.target_team == turn.team_type else 0.2
-    power = {'smallRobot': 5, 'middleRobot': 10, 'largeRobot': 20, 'bossRobot': 40}.get(robot.kind, 5)
-    return own * (1 + power / 20 + 6 / max(1, d-2))
-
-
-def on_segment(start, end, point):
-    # Segment against the robot's closed unit square (center coordinates).
-    # Exact edge/corner treatment needs confirmation against the judge.
-    low, high = 0.0, 1.0
-    for a, b, c in ((start.x, end.x, point.x), (start.y, end.y, point.y)):
-        delta = b-a
-        if delta == 0:
-            if abs(a-c) > 0.5:
-                return None
-        else:
-            left, right = sorted(((c-0.5-a)/delta, (c+0.5-a)/delta))
-            low, high = max(low, left), min(high, right)
-            if low > high:
-                return None
-    return low
-
-
-def shot_damage(turn, tower, target, remaining):
-    robots = [r for r in turn.robots if remaining.get(r.robot_id, 0) > 0]
-    if tower.kind == 'rocket':
-        return {r.robot_id: min(remaining[r.robot_id], 20 if r.pos == target else 10)
-                for r in robots if distance(r.pos, target) <= 1}
-    hits = []
-    for robot in robots:
-        entry = on_segment(tower.pos, target, robot.pos)
-        if entry is not None:
-            hits.append((entry, robot.robot_id))
-    hits.sort()
-    energy = 10*max(1, tower.level) if tower.kind == 'railgun' else 10
-    damage = {}
-    for _, rid in hits:
-        dealt = min(remaining[rid], energy)
-        damage[rid] = dealt
-        energy -= dealt
-        if tower.kind != 'railgun' or energy <= 0:
-            break
-    return damage
-
-
-def select_targets(turn, tower, remaining):
-    robots = [r for r in turn.robots if remaining.get(r.robot_id, 0) > 0]
-    points = set()
-    for robot in robots:
-        points.add(robot.pos)
-        if tower.kind == 'rocket':
-            points.update(neighbours(robot.pos))
-    points = sorted((p for p in points if 0 <= p.x < turn.width and 0 <= p.y < turn.height
-                     and distance(tower.pos, p) <= tower.range_of_attack()), key=lambda p: (p.x, p.y))
-    count = max(1, min(3, tower.level)) if tower.kind in ('rocket', 'gatling') else 1
-    weights = {r.robot_id: threat(turn, r) for r in robots}
-    selected = []
-    for _ in range(count):
-        best, best_damage, best_score = None, {}, 0
-        for target in points:
-            if tower.kind == 'gatling' and any(
-                    (target.x-tower.pos.x)*(p.x-tower.pos.x) +
-                    (target.y-tower.pos.y)*(p.y-tower.pos.y) < 0 for p in selected):
-                continue
-            damage = shot_damage(turn, tower, target, remaining)
-            score = sum(value*weights[rid] + (4*weights[rid] if value == remaining[rid] else 0)
-                        for rid, value in damage.items())
-            if score > best_score:
-                best, best_damage, best_score = target, damage, score
-        if best is None:
-            break
-        selected.append(best)
-        for rid, value in best_damage.items():
-            remaining[rid] -= value
-    # Interface requires the target count to match the weapon level.
-    if selected:
-        selected.extend([selected[-1]] * (count-len(selected)))
-    return selected
+            elif not self.economic.use_consumable(role):
+                options = self.economic.held_options(role)
+                adjacent = [o for o in options if distance(role.pos, o[4].pos) <= 1
+                            and o[2] not in serviced and o[2] not in plan]
+                if adjacent:
+                    _,_,_,item,target = min(adjacent, key=lambda o:(o[0],o[2]))
+                    self.commands[str(role.unit_id)] = {'action':'use','name':item,
+                                                        'targetPos':[target.pos.dump()]}
+                    serviced.add(target.unit_id)
