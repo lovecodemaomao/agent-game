@@ -181,6 +181,10 @@ class Tasks:
                 return entry
         return None
 
+    def can_work(self):
+        """需求4: 夜间在"夜战结束"之后同样可以采矿/做任务(官方动作无昼夜限制)。"""
+        return bool(self.turn.is_day or self.p.battle_over)
+
     def run(self):
         self.sync_task()
         self.receive()
@@ -261,9 +265,9 @@ class Tasks:
         task = self.m.task
         role = self.pioneer
         if not any(distance(role.pos,q)<=1 for q in task['positions']):
-            # 不在任务交互范围内不发 executeCmd; 但已经开始处理的任务若被挤开,
-            # 要自己走回任务点(否则"接了任务却再也不去"= 白丢一个任务)。
-            if not self.turn.is_day or not task['history']:
+            # 不在任务交互范围内不发 executeCmd; 但任务仍然有效就走回任务点 ——
+            # 否则"接了任务却再也不去"会一直拖到超时(夜间战斗未结束时不走, 先守阵位)。
+            if not self.can_work():
                 return False
             routes = self.p.route(role)
             target = min(task['positions'],key=routes.distance)
@@ -284,7 +288,8 @@ class Tasks:
         proposal = task.pop('proposal',None)
         # Preserve the task while reasoning, but do not sacrifice mandatory defense.
         deadline = task['start']+task['timeout']
-        returning = (not self.turn.is_day or self.p.remaining <= self.p.home_cost(role,role.pos)+5)
+        returning = (not self.can_work()
+                     or self.p.remaining <= self.p.home_cost(role,role.pos)+5)
         # ① 快速通道: 同类任务直接重放已验证命令(零探测、零 LLM 往返)
         #    已验证的 SOP 最省回合, 因此排在预设模板之前。
         if task.get('reuse') and not task['waiting_cmd'] and not returning:

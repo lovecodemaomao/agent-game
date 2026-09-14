@@ -96,6 +96,21 @@ class Economy:
         if self.m.day_start_gold>STATION_TIER2_GOLD and level>=2: return 2
         return level
 
+    def wall_pressure_high(self):
+        """需求6: 第3天起, 若前一晚围墙承伤超过 50%, 当天武器升级让位给围墙升级券。"""
+        if not self.turn.walls(): return False
+        return bool(self.m.wall_pressure_high)
+
+    def fixer_targets(self):
+        """需要修复包的受损墙: 第3天起只有 2/3 级墙(1 级带伤走"拆掉重建", 石头免费)。"""
+        out=[]
+        for w in self.damaged_walls():
+            if max(1,min(3,w.level))>=2:
+                out.append(w)
+            elif (self.m.day or ((self.turn.round_no-1)//130+1))<WALL_MAINTENANCE_DAY:
+                out.append(w)      # 第3天之前还没有重建机制, 只能靠修复包
+        return out
+
     def wall_quota_left(self):
         """当天还需完成的围墙升级数量（没有可升级的围墙时视为已完成）。"""
         upgradable=any(max(1,min(3,w.level))<2 for w in self.turn.walls())
@@ -145,14 +160,19 @@ class Economy:
                 if level>=3: continue
                 prefix='Station' if u.kind=='station' else 'Wall' if u.kind=='wall' else 'Weapon'
                 item=f'{prefix}UpgradeVoucher{level}'
+                pressure = self.wall_pressure_high()
                 if u.kind=='rocket':
-                    # 武器升级优先级最高: 趁前期金币充裕尽快升到满级(3级)
-                    priority = 0.5 if level==1 else 0.6
+                    # 武器升级优先级最高: 趁前期金币充裕尽快升到满级(3级);
+                    # 需求6: 昨夜围墙吃紧 -> 武器升级让位, 先补围墙券
+                    priority = (2.0 if level==1 else 2.1) if pressure else (0.5 if level==1 else 0.6)
                 elif u.kind in ('railgun','gatling'):
-                    priority = 0.8 if level==1 else 0.9
+                    priority = (2.0 if level==1 else 2.1) if pressure else (0.8 if level==1 else 0.9)
                 elif u.kind=='wall':
-                    # 武器升级优先于围墙升级(武器要尽快满级)
-                    priority = 1.2 if (level==1 and wall_quota) else (2.0 if level==1 else 2.4)
+                    # 武器升级优先于围墙升级(武器要尽快满级); 承伤吃紧时反过来
+                    if pressure:
+                        priority = 0.9 if level==1 else 1.0
+                    else:
+                        priority = 1.2 if (level==1 and wall_quota) else (2.0 if level==1 else 2.4)
                 else:                      # station 常规升级(未到濒危/兜底条件)
                     priority = 2.2 if level==1 else 2.6
             # 围墙: 越朝向机器人越优先（self.p.walls 已按迎敌方向由前到后排序），
@@ -283,11 +303,12 @@ class Economy:
         shops=[q for q,k in self.turn.zones.items() if k=='weaponShop']
         # 为尚未满级的武器保留券预算，围墙券只使用超出的金币。
         weapon_reserve=0
-        for w in self.turn.weapons():
-            lv=max(1,min(3,w.level))
-            if lv<3:
-                need='WeaponUpgradeVoucher%d'%lv
-                weapon_reserve=max(weapon_reserve,int(self.p.shop_prices.get(need,0)))
+        if not self.wall_pressure_high():      # 需求6: 围墙吃紧时不替武器券攒钱
+            for w in self.turn.weapons():
+                lv=max(1,min(3,w.level))
+                if lv<3:
+                    need='WeaponUpgradeVoucher%d'%lv
+                    weapon_reserve=max(weapon_reserve,int(self.p.shop_prices.get(need,0)))
         for priority,level,uid,item,target in self.options():
             price=self.p.shop_prices.get(item)
             if price is None or price>self.p.gold: continue
@@ -331,7 +352,7 @@ class Economy:
                 and not any(j.get('type') in ('upgrade','order') for j in self.m.jobs.values()):
             stock=sum(r.backpack.count('WallFixer') for r in self.turn.workers())
             price=self.p.shop_prices.get('WallFixer')
-            damaged=len(self.damaged_walls())
+            damaged=len(self.fixer_targets())
             target=min(WALL_FIXER_RESERVE, max(2, damaged)) if damaged else WALL_FIXER_RESERVE
             if (self.turn.walls() and price is not None and stock<target
                     and self.p.gold>price):
@@ -488,8 +509,9 @@ class Economy:
         needs_weapon=any(max(1,min(3,w.level))<3 for w in self.turn.weapons())
         affordable_weapon=any(self.p.shop_prices.get(item,10**9)<=self.p.gold
                               for _,_,_,item,_ in candidates if item.startswith('Weapon'))
-        if needs_weapon and self.weapon_quota_left()>0 and not affordable_weapon:
-            return False
+        if (needs_weapon and self.weapon_quota_left()>0 and not affordable_weapon
+                and not self.wall_pressure_high()):
+            return False        # 需求6: 围墙吃紧时改买围墙券
         for _,level,uid,item,target in candidates:
             price=self.p.shop_prices.get(item)
             if price is None or price<=0: continue
@@ -505,7 +527,8 @@ class Economy:
         if price is None or not self.turn.walls() or self.p.gold<price: return False
         if any(j.get('item')=='WallFixer' for j in self.m.jobs.values()): return False
         stock=sum(r.backpack.count('WallFixer') for r in self.turn.controllable())
-        if stock>=WALL_FIXER_RESERVE: return False
+        damaged=len(self.fixer_targets())
+        if stock>=max(1, min(WALL_FIXER_RESERVE, damaged)): return False
         num=max(1,min(WALL_FIXER_RESERVE-stock,int(self.p.gold//price)))
         self.p.commands[str(role.unit_id)]={'action':'buy','name':'WallFixer','num':num}
         self.p.gold-=price*num
@@ -517,7 +540,9 @@ class Economy:
 
         只做"不耽误入夜前回到武器旁"的顺路采集：矿点必须在基地附近，
         且 走到矿点 + 采一次 + 从矿点回位 + 返程余量 仍在白昼剩余回合内。
+        夜间不走这里 —— 夜间开工(需求4)由 Economy.act 直接去次日矿点采矿。
         """
+        if not self.turn.is_day: return False
         if role.backpack_full: return False
         station=self.turn.station()
         if station is None: return False

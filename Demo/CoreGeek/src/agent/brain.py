@@ -13,7 +13,8 @@ from .economy import Economy
 from .tasks import Tasks
 from .protocol import (Pos, Turn, build_command, distance, move_command,
                        station_footprint)
-from .economy import DAY1_ORE_PHASE_ROUNDS, NIGHT_PREPOSITION_ROUND, WALL_MAINTENANCE_DAY
+from .economy import (DAY1_ORE_PHASE_ROUNDS, DAY_ROUNDS, NIGHT_PREPOSITION_ROUND,
+                          WALL_MAINTENANCE_DAY)
 from .fire_control import plan_fire, select_targets, shot_damage, threat, on_segment
 
 LOADOUT = ("rocket", "rocket", "rocket")   # 要求: 75 金币开局买三座火箭炮
@@ -121,8 +122,18 @@ class Planner:
         self.walls = wall_sites(turn, extend=1 if self.day >= WALL_MAINTENANCE_DAY else 0)
         self.home_cost_cache = {}
         self.route_cache = {}
-        # 可用回合预算到当天第 RETURN_DEADLINE 回合为止（含入夜 5 回合, 夜间可移动）
-        self.remaining = max(0, RETURN_DEADLINE - (turn.round_no - 1) % 130)
+        # 可用回合预算: 白天到当天第 RETURN_DEADLINE 回合为止(含入夜 5 回合)。
+        # 夜间在"夜战结束"后可以直接开工(需求4: 夜间可采矿/做任务), 此时把预算
+        # 设成"一个完整白天"(RETURN_DEADLINE) —— 与次日白天的预算一致, 这样夜间
+        # 选定的矿点/行程到次日清晨不会被重新规划成另一条路线(否则来回摇摆)。
+        # 夜战未结束则预算为 0: 只守不干活。
+        self.battle_over = self._battle_over(turn)
+        if turn.is_day:
+            self.remaining = max(0, RETURN_DEADLINE - (turn.round_no - 1) % 130)
+        elif self.battle_over:
+            self.remaining = RETURN_DEADLINE
+        else:
+            self.remaining = 0
         self.economic = Economy(self)
 
     def route(self, role):
@@ -250,8 +261,12 @@ class Planner:
     def run(self):
         if not self.turn.is_day:
             tasks = Tasks(self)
-            tasks.sync_task()
-            tasks.receive()
+            if self.battle_over:
+                # 需求4: 夜战结束后开拓者立即去任务点继续做任务(领取/执行/提交)
+                tasks.run()
+            else:
+                tasks.sync_task()
+                tasks.receive()
             self.night()
             return self.commands
         if self.payload.get('phaseTask'):
@@ -496,17 +511,27 @@ class Planner:
         self.economic.prepare()
         return self.economic.act(role,routes)
 
-    def night_battle_over(self):
-        """需求4: 夜战是否已结束(机器人清空, 或已到夜末且附近无威胁)。"""
-        rod = (self.turn.round_no-1) % 130 + 1
-        towers = [t.pos for t in self.turn.weapons()]
-        living = [r for r in self.turn.robots if r.health > 0]
-        if any(towers and min(distance(r.pos, p) for p in towers) <= PREPOSITION_SAFE_RADIUS
+    @staticmethod
+    def _battle_over(turn):
+        """夜战是否已结束(机器人清空, 或已到夜末且阵前无威胁)。
+
+        威胁半径以武器塔为锚点; 还没有武器塔时以基地占地为锚点(否则无从判断)。
+        """
+        rod = (turn.round_no-1) % 130 + 1
+        anchors = [t.pos for t in turn.weapons()]
+        if not anchors:
+            station = turn.station()
+            anchors = list(station_footprint(station.pos)) if station is not None else []
+        living = [r for r in turn.robots if r.health > 0]
+        if any(anchors and min(distance(r.pos, p) for p in anchors) <= PREPOSITION_SAFE_RADIUS
                for r in living):
             return False                     # 阵前还有敌人 -> 留在炮位
         if not living:
             return True
         return rod >= NIGHT_PREPOSITION_ROUND
+
+    def night_battle_over(self):
+        return self.battle_over
 
     def post_target(self, role, routes):
         """下一天的岗位: 开拓者 -> 任务点旁; 工人 -> 次日矿点的采集邻格。"""
@@ -609,3 +634,16 @@ class Planner:
             if str(role.unit_id) in self.commands:
                 continue
             self.continue_preposition(role)
+        # 需求4: 夜战结束后夜间可以采矿/出售 —— 工人立刻在下一天要去的矿点开工
+        # (夜间没打完则不进这里: 上面的防守/回塔逻辑已经占了指令)
+        if self.battle_over:
+            for role in self.turn.workers():
+                if str(role.unit_id) in self.commands or role.unit_id in self.engaged:
+                    continue
+                if self.economic.act_urgent(role, self.route(role)) or \
+                        self.economic.act(role, self.route(role)):
+                    # 已开工的角色按"已占下一天岗位"记账, 否则下一回合会被
+                    # 炮位分配拉回基地, 与研究矿点的行程来回摇摆(实测 2 格死循环)
+                    self.memory.prepositioned.add(role.unit_id)
+        else:
+            self.memory.prepositioned.clear()   # 战斗重新开始 -> 交回炮位分配

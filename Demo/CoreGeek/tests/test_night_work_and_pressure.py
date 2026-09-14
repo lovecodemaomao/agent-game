@@ -1,0 +1,219 @@
+"""需求4 补充(夜间开工) 与需求6(围墙承伤改取向) 的回归测试。
+
+需求4: 官方动作里 collect/sell/buy/use/acceptTask/submitAnswer/executeCmd 都没有昼夜限制
+        (只有 build 限白天、attack 限黑夜), 所以"夜战结束后"工人应当直接在矿点采矿,
+        开拓者应当直接在任务点继续做题, 而不是只站在旁边等天亮。
+需求6: 第3天白天起, 若前一晚围墙承伤超过 50%, 当天降低武器升级优先级、提高围墙升级券
+        优先级; 但基地一旦受伤, 基地升级券仍是第一优先级。
+"""
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_strategy import fixture, unit
+from test_rule45_walls_night import build_payload, robot
+from test_task_templates import ENGINEER_DESC, task_payload
+from agent.brain import Planner, decide_response, wall_sites
+from agent.memory import Memory, WALL_PRESSURE_DAY, WALL_PRESSURE_RATIO
+from agent.protocol import Pos, Turn, distance
+from agent.tasks import Tasks
+
+
+def night_payload(day=3, rod=126, robots=(), roles=None, walls=(), gold=0):
+    p = build_payload(day=day, gold=gold, robots=robots, roles=roles, walls=walls, rod=rod)
+    return p
+
+
+class NightWorkTests(unittest.TestCase):
+    """需求4: 夜战结束后夜间直接开工。"""
+
+    def test_worker_walks_to_the_mine_and_then_collects(self):
+        p = night_payload(rod=124)
+        m = Memory(day=3)
+        collected = False
+        for _ in range(6):
+            planner = Planner(Turn.load(p), p, m)
+            planner.run()
+            command = planner.commands.get('2')
+            if not command:
+                break
+            for role in p['teamOur']['roles']:
+                if role['id'] == 2 and command.get('targetPos'):
+                    role['pos'] = command['targetPos'][0]
+            if command['action'] == 'collect':
+                collected = True
+                break
+            p['roundNo'] += 1
+        self.assertTrue(collected, '夜间应当走到矿点并开始采集(而不是只站位)')
+
+    def test_worker_stays_on_defense_when_the_battle_is_not_over(self):
+        p = night_payload(rod=100, robots=[robot(1, 9, 24)])      # 阵前有敌
+        m = Memory(day=3)
+        planner = Planner(Turn.load(p), p, m)
+        self.assertFalse(planner.battle_over)
+        self.assertEqual(planner.remaining, 0, '战斗中夜间不发放工作预算')
+        planner.run()
+        for uid, command in planner.commands.items():
+            self.assertNotEqual(command['action'], 'collect', (uid, command))
+
+    def test_pioneer_can_solve_the_task_at_night(self):
+        # 夜战结束后: 开拓者在任务点旁直接执行预设命令(此前夜间被 returning 挡住)
+        desc = ENGINEER_DESC % '/tmp/selfEvolutionTask/x/ws_1/'
+        p = task_payload(desc)
+        p['roundNo'] = 130                     # 第1天夜里(无机器人 -> 战斗结束)
+        m = Memory(day=1)
+        response = decide_response(p, m)
+        self.assertIn('check', response['executeCmd'], response)
+        self.assertIsNotNone(m.task)
+
+    def test_night_task_work_stops_when_robots_return(self):
+        desc = ENGINEER_DESC % '/tmp/selfEvolutionTask/x/ws_1/'
+        p = task_payload(desc)
+        p['roundNo'] = 130
+        p['robot'] = {'roles': [robot(1, 12, 25)]}      # 机器人就在开拓者身边
+        m = Memory(day=1)
+        response = decide_response(p, m)
+        self.assertEqual(response['executeCmd'], '', '战斗未结束不应执行任务命令')
+
+    def test_can_work_reflects_day_night_and_battle(self):
+        day = task_payload('任务')
+        day['roundNo'] = 10
+        planner = Planner(Turn.load(day), day, Memory(day=1))
+        self.assertTrue(Tasks(planner).can_work())
+
+        night = task_payload('任务')
+        night['roundNo'] = 130
+        planner = Planner(Turn.load(night), night, Memory(day=1))
+        self.assertTrue(Tasks(planner).can_work())
+
+        fight = task_payload('任务')
+        fight['roundNo'] = 130
+        fight['robot'] = {'roles': [robot(1, 10, 24)]}
+        planner = Planner(Turn.load(fight), fight, Memory(day=1))
+        self.assertFalse(Tasks(planner).can_work())
+
+
+class WallPressureTests(unittest.TestCase):
+    """需求6: 前一晚围墙承伤 > 50% -> 当天围墙券优先于武器券(基地券仍第一)。"""
+
+    def pressure_payload(self, day=3, rod=80, health=(300, 300), level=1):
+        sites = wall_sites(Turn.load(build_payload(day=day)))
+        walls = [unit(40, 'wall', sites[0].x, sites[0].y, health=health[0], level=level),
+                 unit(41, 'wall', sites[1].x, sites[1].y, health=health[1], level=level)]
+        return build_payload(day=day, walls=walls, rod=rod)
+
+    def run_night_then_next_day(self, night_payload, next_day, day):
+        m = Memory()
+        # 当天白天起点: 墙满血
+        decide_response(self.pressure_payload(day=day, rod=1, health=(1000, 1000)), m)
+        # 夜里(第 80 回合)被打掉大量血
+        decide_response(night_payload, m)
+        # 次日白天
+        decide_response(self.pressure_payload(day=next_day, rod=1, health=(300, 300)), m)
+        return m
+
+    def test_heavy_night_damage_marks_high_pressure_from_day3(self):
+        night = self.pressure_payload(day=2, rod=80, health=(200, 200))
+        m = self.run_night_then_next_day(night, 3, 2)
+        self.assertGreater(m.wall_pressure, WALL_PRESSURE_RATIO, m.wall_pressure)
+        self.assertTrue(m.wall_pressure_high)
+
+    def test_heavy_night_damage_on_day1_does_not_count_yet(self):
+        night = self.pressure_payload(day=1, rod=80, health=(200, 200))
+        m = self.run_night_then_next_day(night, 2, 1)
+        self.assertFalse(m.wall_pressure_high, '第3天白天之前不计算承伤取向')
+
+    def test_single_wall_halved_in_a_night_is_also_high_pressure(self):
+        # 只有一面墙被打掉一半以上, 整体不足 50% -> 同样算"围墙承伤超过50%"
+        sites = wall_sites(Turn.load(build_payload(day=2)))
+        walls = [unit(40, 'wall', sites[0].x, sites[0].y, health=400),
+                 unit(41, 'wall', sites[1].x, sites[1].y, health=1000),
+                 unit(42, 'wall', sites[2].x, sites[2].y, health=1000)]
+        night = build_payload(day=2, walls=walls, rod=80)
+        m = Memory()
+        decide_response(build_payload(day=2, rod=1, walls=[
+            unit(40, 'wall', sites[0].x, sites[0].y, health=1000),
+            unit(41, 'wall', sites[1].x, sites[1].y, health=1000),
+            unit(42, 'wall', sites[2].x, sites[2].y, health=1000)]), m)
+        decide_response(night, m)
+        decide_response(build_payload(day=3, rod=1, walls=[
+            unit(40, 'wall', sites[0].x, sites[0].y, health=400),
+            unit(41, 'wall', sites[1].x, sites[1].y, health=1000),
+            unit(42, 'wall', sites[2].x, sites[2].y, health=1000)]), m)
+        self.assertGreater(m.wall_worst, WALL_PRESSURE_RATIO, m.wall_worst)
+        self.assertLessEqual(m.wall_pressure, WALL_PRESSURE_RATIO, m.wall_pressure)
+        self.assertTrue(m.wall_pressure_high)
+
+    def test_light_night_damage_is_not_high_pressure(self):
+        night = self.pressure_payload(day=2, rod=80, health=(950, 950))
+        m = self.run_night_then_next_day(night, 3, 2)
+        self.assertLessEqual(m.wall_pressure, WALL_PRESSURE_RATIO, m.wall_pressure)
+        self.assertFalse(m.wall_pressure_high)
+
+    def test_wall_voucher_outranks_weapon_when_pressure_is_high(self):
+        sites = wall_sites(Turn.load(build_payload(day=3)))
+        walls = [unit(40, 'wall', sites[0].x, sites[0].y, health=1000),
+                 unit(41, 'wall', sites[1].x, sites[1].y, health=1000)]
+        p = build_payload(day=3, walls=walls, rod=1)
+        m = Memory(day=3)
+        m.wall_pressure_high = True
+        planner = Planner(Turn.load(p), p, m)
+        first = planner.economic.options()[0][3]
+        self.assertTrue(first.startswith('Wall'), first)
+
+    def test_weapon_voucher_still_first_without_pressure(self):
+        sites = wall_sites(Turn.load(build_payload(day=3)))
+        walls = [unit(40, 'wall', sites[0].x, sites[0].y, health=1000)]
+        p = build_payload(day=3, walls=walls, rod=1)
+        m = Memory(day=3)
+        m.wall_pressure_high = False
+        planner = Planner(Turn.load(p), p, m)
+        first = planner.economic.options()[0][3]
+        self.assertTrue(first.startswith('Weapon'), first)
+
+    def test_damaged_station_still_outranks_everything(self):
+        sites = wall_sites(Turn.load(build_payload(day=3)))
+        walls = [unit(40, 'wall', sites[0].x, sites[0].y, health=1000)]
+        p = build_payload(day=3, walls=walls, rod=1, station_health=900)
+        m = Memory(day=3)
+        m.wall_pressure_high = True
+        planner = Planner(Turn.load(p), p, m)
+        self.assertEqual(planner.economic.options()[0][3], 'StationUpgradeVoucher1')
+
+    def test_high_pressure_releases_the_weapon_reserve(self):
+        sites = wall_sites(Turn.load(build_payload(day=3)))
+        walls = [unit(40, 'wall', sites[0].x, sites[0].y, health=1000)]
+        p = build_payload(day=3, gold=40, walls=[walls[0]], rod=1)
+        memory = Memory(day=3)
+        planner = Planner(Turn.load(p), p, memory)
+        planner.economic.prepare()
+        jobs = [j for j in memory.jobs.values() if j.get('item', '').startswith('Wall')]
+        self.assertFalse(jobs, '无承伤压力时应保留金币给下一张武器券')
+
+        memory2 = Memory(day=3)
+        memory2.wall_pressure_high = True
+        planner2 = Planner(Turn.load(p), p, memory2)
+        planner2.economic.prepare()
+        jobs2 = [j for j in memory2.jobs.values() if j.get('item', '').startswith('Wall')]
+        self.assertTrue(jobs2, '承伤吃紧时应当直接买围墙升级券')
+
+    def test_pioneer_standby_buys_wall_voucher_under_pressure(self):
+        p = build_payload(day=3, gold=60, rod=1,
+                          zones=[{'pos': {'x': 6, 'y': 24}, 'neutralType': 'stone'},
+                                 {'pos': {'x': 7, 'y': 24}, 'neutralType': 'weaponShop'}])
+        sites = wall_sites(Turn.load(p))
+        p['teamOur']['roles'].append(unit(40, 'wall', sites[0].x, sites[0].y, health=1000))
+        p['teamOur']['roles'][3]['pos'] = {'x': 7, 'y': 25}      # 开拓者站在商店旁
+        memory = Memory(day=3)
+        memory.wall_pressure_high = True
+        planner = Planner(Turn.load(p), p, memory)
+        self.assertTrue(planner.pioneer_standby())
+        command = planner.commands.get('4')
+        self.assertEqual(command['action'], 'buy', command)
+        self.assertEqual(command['name'], 'WallUpgradeVoucher1')
+
+
+if __name__ == '__main__':
+    unittest.main()

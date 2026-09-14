@@ -1,6 +1,9 @@
 """Per-game memory. Nothing from the judge or LLM is executed in this process."""
 from dataclasses import dataclass, field
 
+WALL_PRESSURE_DAY = 3          # 需求6: 第3天白天起开始计算围墙承伤
+WALL_PRESSURE_RATIO = 0.5      # 需求6: 昨夜围墙承伤超过该比例 -> 当天转向围墙升级券
+
 
 @dataclass
 class Memory:
@@ -33,6 +36,15 @@ class Memory:
     day_start_gold: int = 0                            # 当天开始时的金币(基地券档位判断)
     wall_rebuilds: dict = field(default_factory=dict)  # 需求5: {uid: {pos, stage, unit}} 拆墙重建
     prepositioned: set = field(default_factory=set)    # 需求4: 夜间已去下一天岗位的角色
+    wall_hp: dict = field(default_factory=dict)        # 需求6: {uid: (health, max_hp)} 逐回合核对承伤
+    night_wall_damage: float = 0.0                     # 需求6: 本夜围墙累计掉血
+    night_wall_total: float = 0.0                      # 需求6: 本夜围墙累计最大血量(含被打掉的)
+    wall_pressure: float = 0.0                         # 需求6: 昨夜承伤比例
+    wall_pressure_high: bool = False                   # 需求6: 昨夜承伤 > 50%
+    wall_hp_prev: dict = field(default_factory=dict)   # 需求6: 上一回合 {uid: (health, max)}
+    night_wall_max: dict = field(default_factory=dict)  # 需求6: {uid: max_hp} 今夜出现过的墙
+    night_wall_worst: float = 0.0                      # 需求6: 今夜单面墙最大掉血比例
+    wall_worst: float = 0.0                            # 需求6: 昨夜单面墙最大掉血比例
     day_upgrades: dict = field(default_factory=dict)   # 每日已完成升级: {day: {'wall': n, 'weapon': n}}
     previous_mines: dict = field(default_factory=dict)
     failed_steps: dict = field(default_factory=dict)
@@ -60,6 +72,22 @@ class Memory:
             self.day_start_gold = turn.gold          # 需求3: "当天白天开始时的金币"
             self.prepositioned.clear()               # 需求4: 新的一天重新就位防守
             self.wall_rebuilds.clear()
+            # 需求6: 第3天起, 用"前一晚围墙承伤是否超过 50%"决定当天券的取向
+            total = sum(self.night_wall_max.values())
+            self.wall_pressure = (self.night_wall_damage/total) if total > 0 else 0.0
+            self.wall_worst = self.night_wall_worst
+            # "围墙承伤超过 50%" 的两种读法都算吃紧:
+            #   整体 —— 整条防线一夜掉血超过其总血量的一半;
+            #   单墙 —— 有任意一面墙一夜被打掉一半以上的血。
+            self.wall_pressure_high = bool(
+                day >= WALL_PRESSURE_DAY
+                and (self.wall_pressure > WALL_PRESSURE_RATIO
+                     or self.wall_worst > WALL_PRESSURE_RATIO))
+            self.night_wall_damage = 0.0
+            self.night_wall_worst = 0.0
+            self.night_wall_max = {}
+        # 需求6: 累计夜间围墙承伤(掉血 + 被打掉时的剩余血量); 白天我方 remove/重建不计
+        self._track_wall_damage(turn)
         # 基地受伤是永久状态: 只要掉过血就一直记着, 用来触发基地升级券
         station = turn.station()
         if station is not None and station.health > 0:
@@ -160,6 +188,34 @@ class Memory:
             self.news[:] = self.news[-20:]
             self.news_version += 1
         self.round_no = turn.round_no
+
+    def _track_wall_damage(self, turn):
+        """需求6: 只在夜间统计围墙承伤 —— 掉血量 + 被打掉墙的剩余血量。
+
+        分母是"今夜出现过的墙"的最大血量之和(逐回合取最大, 日切时结算),
+        白天我方 remove/重建 换的是新单位ID, 不计入承伤。
+        """
+        from .economy import HP
+        seen = {}
+        for unit in turn.walls():
+            level = max(1, min(3, unit.level))
+            seen[unit.unit_id] = (unit.health, HP['wall'][level-1])
+        self.wall_hp_prev = self.wall_hp
+        self.wall_hp = seen
+        if turn.is_day:
+            return
+        for uid, (health, maximum) in seen.items():
+            self.night_wall_max[uid] = max(self.night_wall_max.get(uid, 0), maximum)
+            before = self.wall_hp_prev.get(uid)
+            if before is not None and health < before[0]:
+                lost = before[0]-health
+                self.night_wall_damage += lost
+                if maximum > 0:
+                    self.night_wall_worst = max(self.night_wall_worst, lost/maximum)
+        for uid, (health, _maximum) in self.wall_hp_prev.items():
+            if uid not in seen:
+                # 夜里消失 = 被机器人打掉: 剩余血量计入承伤
+                self.night_wall_damage += health
 
     def remember(self, turn, response):
         self.last_commands = response['roleCommandMap'].copy()
