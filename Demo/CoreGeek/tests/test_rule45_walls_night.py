@@ -89,6 +89,47 @@ class StoneIsBuildingMaterialTests(unittest.TestCase):
         self.assertNotIn('stone', command['name'])
 
 
+class StoneMorningOreNightTests(unittest.TestCase):
+    """用户要求: 石头早上采, 夜晚采矿石。"""
+
+    def payload(self, day=2, rod=10):
+        # 缺墙(没有建墙) -> stone_needed 为真, 便于观察时段口径
+        return build_payload(day=day, rod=rod, zones=[
+            {'pos': {'x': 6, 'y': 24}, 'neutralType': 'stone'},
+            {'pos': {'x': 6, 'y': 22}, 'neutralType': 'copper'},
+            {'pos': {'x': 5, 'y': 24}, 'neutralType': 'vendor'},
+            {'pos': {'x': 7, 'y': 24}, 'neutralType': 'weaponShop'},
+        ])
+
+    def test_morning_worker_fetches_stone_when_walls_are_missing(self):
+        p = self.payload(rod=10)
+        planner = Planner(Turn.load(p), p, Memory(day=2))
+        worker = planner.turn.workers()[0]
+        self.assertTrue(planner.economic.stone_needed(), '缺墙时需要采石')
+        self.assertEqual(planner.economic.wanted_kinds(worker), ('stone',))
+
+    def test_late_day_worker_mines_ore_instead_of_stone(self):
+        p = self.payload(rod=55)                    # 过了早上窗口
+        planner = Planner(Turn.load(p), p, Memory(day=2))
+        worker = planner.turn.workers()[0]
+        self.assertEqual(planner.economic.wanted_kinds(worker), ('iron', 'copper'),
+                         '白天其余时间不再专门采石')
+
+    def test_night_worker_mines_ore_not_stone(self):
+        for rod in (75, 100, 128):
+            p = self.payload(rod=rod)
+            planner = Planner(Turn.load(p), p, Memory(day=2))
+            worker = planner.turn.workers()[0]
+            self.assertEqual(planner.economic.wanted_kinds(worker), ('iron', 'copper'),
+                             f'夜间(rod{rod})应当采矿石')
+
+    def test_day1_ore_phase_still_mines_ore_first(self):
+        p = self.payload(day=1, rod=20)             # 第1天前30回合赚钱优先
+        planner = Planner(Turn.load(p), p, Memory(day=1))
+        worker = planner.turn.workers()[0]
+        self.assertEqual(planner.economic.wanted_kinds(worker), ('iron', 'copper'))
+
+
 class WallExtensionTests(unittest.TestCase):
     """需求5: 第3天白天把墙两边往后再多加一格, 变成 12 格。"""
 
@@ -120,7 +161,8 @@ class WallExtensionTests(unittest.TestCase):
 
 
 class WallMaintenanceTests(unittest.TestCase):
-    """需求5: 第3天掉血的一级墙拆掉重建, 掉血的二级墙用修复包。"""
+    """需求5(现版): 一级墙不再拆掉重建 —— 带伤墙交给围墙升级券(升级即回满血);
+    掉血超过 50% 的二级墙用围墙修复包。"""
 
     def level1_damaged_payload(self, day=3, health=400, rod=10):
         sites = wall_sites(Turn.load(build_payload(day=day)))
@@ -129,82 +171,29 @@ class WallMaintenanceTests(unittest.TestCase):
         p['teamOur']['roles'][1]['pos'] = {'x': sites[0].x - 1, 'y': sites[0].y}
         return p, sites[0]
 
-    def test_level1_damaged_wall_is_a_rebuild_target_on_day3(self):
+    def test_level1_damaged_wall_is_never_demolished(self):
         p, _ = self.level1_damaged_payload()
-        planner = Planner(Turn.load(p), p, Memory(day=3))
-        self.assertEqual([w.unit_id for w in planner.economic.rebuild_targets()], [40])
-
-    def test_level1_wall_losing_less_than_half_is_left_alone_on_day3(self):
-        # 需求5(改): 第3天只处理掉血超过 50% 的一级墙
-        p, _ = self.level1_damaged_payload(health=800)
-        planner = Planner(Turn.load(p), p, Memory(day=3))
-        self.assertEqual(planner.economic.rebuild_targets(), [])
-
-    def test_level1_damaged_wall_is_not_rebuilt_before_day3(self):
-        p, _ = self.level1_damaged_payload(day=2)
-        planner = Planner(Turn.load(p), p, Memory(day=2))
-        self.assertEqual(planner.economic.rebuild_targets(), [])
-
-    def test_level1_damaged_wall_takes_no_upgrade_voucher_on_day3(self):
-        p, _ = self.level1_damaged_payload()
-        planner = Planner(Turn.load(p), p, Memory(day=3))
-        items = [o[3] for o in planner.economic.options()]
-        self.assertNotIn('WallUpgradeVoucher1', items)
-        self.assertNotIn('WallFixer', items)
-
-    def test_worker_removes_then_rebuilds_the_wall(self):
-        p, pos = self.level1_damaged_payload()
         p['teamOur']['roles'][1]['backpack'] = ['stone']
         m = Memory(day=3)
         planner = Planner(Turn.load(p), p, m)
-        worker = [w for w in planner.turn.workers() if w.unit_id == 2][0]
-        self.assertTrue(planner.maintain_walls(worker, planner.route(worker)))
-        self.assertEqual(planner.commands['2'], {'action': 'remove', 'targetPos': [pos.dump()]})
-        # 下一回合: 墙已拆掉 -> 原地重建(消耗一块石头)
-        p['roundNo'] += 1
-        del p['teamOur']['roles'][[r['id'] for r in p['teamOur']['roles']].index(40)]
-        planner = Planner(Turn.load(p), p, m)
-        worker = [w for w in planner.turn.workers() if w.unit_id == 2][0]
-        self.assertTrue(planner.maintain_walls(worker, planner.route(worker)))
-        command = planner.commands['2']
-        self.assertEqual(command['action'], 'build')
-        self.assertEqual(command['name'], 'wall')
-        self.assertEqual(Pos.load(command['targetPos'][0]), pos)
+        for _ in range(3):
+            planner = Planner(Turn.load(p), p, m)
+            planner.run()
+            self.assertNotIn('remove', [c['action'] for c in planner.commands.values()], planner.commands)
+            p['roundNo'] += 1
 
-    def test_rebuild_needs_a_stone_so_worker_fetches_first(self):
-        p, pos = self.level1_damaged_payload()
-        m = Memory(day=3)
-        planner = Planner(Turn.load(p), p, m)
-        worker = [w for w in planner.turn.workers() if w.unit_id == 2][0]
-        job = planner.memory.wall_rebuilds.setdefault(2, {'pos': pos, 'stage': 'build', 'unit': 40})
-        del p['teamOur']['roles'][[r['id'] for r in p['teamOur']['roles']].index(40)]
-        planner = Planner(Turn.load(p), p, m)
-        worker = [w for w in planner.turn.workers() if w.unit_id == 2][0]
-        self.assertTrue(planner.maintain_walls(worker, planner.route(worker)))
-        command = planner.commands['2']
-        self.assertIn(command['action'], ('move', 'collect'), command)
-
-    def test_only_one_worker_is_assigned_to_rebuilding(self):
-        p, pos = self.level1_damaged_payload()
-        m = Memory(day=3)
-        m.wall_rebuilds[3] = {'pos': Pos(pos.x, pos.y + 1), 'stage': 'build', 'unit': 41}
-        planner = Planner(Turn.load(p), p, m)
-        worker = [w for w in planner.turn.workers() if w.unit_id == 2][0]
-        self.assertFalse(planner.maintain_walls(worker, planner.route(worker)))
-
-    def test_level2_damaged_wall_is_repaired_with_fixer_on_day3(self):
-        sites = wall_sites(Turn.load(build_payload(day=3)))
-        wall = unit(40, 'wall', sites[0].x, sites[0].y, health=700, level=2)   # 2级满血1500, 掉血过半
-        p = build_payload(day=3, walls=[wall])
-        p['teamOur']['roles'][1]['pos'] = {'x': sites[0].x - 1, 'y': sites[0].y}
-        p['teamOur']['roles'][1]['backpack'] = ['WallFixer']
+    def test_damaged_level1_wall_can_take_a_wall_voucher_now(self):
+        # 不再有"重建"这条路 -> 带伤一级墙照常参与围墙升级券(升级会回满血)
+        p, _ = self.level1_damaged_payload()
         planner = Planner(Turn.load(p), p, Memory(day=3))
-        self.assertIn(40, [w.unit_id for w in planner.economic.damaged_walls()])
-        planner.run()
-        command = planner.commands.get('2')
-        self.assertIsNotNone(command, planner.commands)
-        self.assertEqual(command['action'], 'use')
-        self.assertEqual(command['name'], 'WallFixer')
+        items = [o[3] for o in planner.economic.options()]
+        self.assertIn('WallUpgradeVoucher1', items)
+
+    def test_damaged_level1_wall_takes_no_fixer(self):
+        # 一级墙带伤也不买修复包(修复包只给 2/3 级墙)
+        p, _ = self.level1_damaged_payload()
+        planner = Planner(Turn.load(p), p, Memory(day=3))
+        self.assertEqual([w.unit_id for w in planner.economic.fixer_targets()], [])
 
     def test_slight_damage_is_ignored_before_day3(self):
         sites = wall_sites(Turn.load(build_payload(day=2)))
@@ -213,12 +202,110 @@ class WallMaintenanceTests(unittest.TestCase):
         planner = Planner(Turn.load(p), p, Memory(day=2))
         self.assertEqual(planner.economic.damaged_walls(), [])
 
-    def test_no_wall_voucher_for_wall_that_will_be_rebuilt(self):
-        p, _ = self.level1_damaged_payload()
+    def test_level2_damaged_wall_is_repaired_with_fixer_on_day3(self):
+        sites = wall_sites(Turn.load(build_payload(day=3)))
+        wall = unit(40, 'wall', sites[0].x, sites[0].y, health=700, level=2)   # 2级满血1500, 掉血过半
+        p = build_payload(day=3, walls=[wall])
+        p['teamOur']['roles'][1]['pos'] = {'x': sites[0].x - 1, 'y': sites[0].y}
+        p['teamOur']['roles'][1]['backpack'] = ['WallFixer']
         planner = Planner(Turn.load(p), p, Memory(day=3))
-        worker = planner.turn.workers()[0]
-        count = planner.economic.purchase_count(worker, 'WallUpgradeVoucher1', 20, 4)
-        self.assertEqual(count, 0, '掉血的一级墙要重建, 不该为它买升级券')
+        self.assertIn(40, [w.unit_id for w in planner.economic.fixer_targets()])
+        planner.run()
+        command = planner.commands.get('2')
+        self.assertIsNotNone(command, planner.commands)
+        self.assertEqual(command['action'], 'use')
+        self.assertEqual(command['name'], 'WallFixer')
+
+    def test_level2_wall_losing_less_than_half_is_left_alone(self):
+        sites = wall_sites(Turn.load(build_payload(day=3)))
+        wall = unit(40, 'wall', sites[0].x, sites[0].y, health=900, level=2)   # 掉血 40%
+        p = build_payload(day=3, walls=[wall])
+        planner = Planner(Turn.load(p), p, Memory(day=3))
+        self.assertEqual(planner.economic.fixer_targets(), [])
+
+
+class ShopStandbyTests(unittest.TestCase):
+    """需求2: 开拓者无任务时站商店旁按计划买券, 硬性前提是白天结束前回到武器塔旁。"""
+
+    def shop_payload(self, rod, shop_x=20, gold=250):
+        """基地在 (10,24), 武器商店放在 (shop_x,24); 开拓者先站在商店旁。"""
+        p = build_payload(day=1, gold=gold, rod=rod, zones=[
+            {'pos': {'x': shop_x, 'y': 24}, 'neutralType': 'weaponShop'},
+            {'pos': {'x': 6, 'y': 24}, 'neutralType': 'stone'},
+            {'pos': {'x': 5, 'y': 24}, 'neutralType': 'vendor'},
+        ])
+        for role in p['teamOur']['roles']:
+            if role['id'] == 4:
+                role['pos'] = {'x': shop_x - 1, 'y': 24}
+        return p
+
+    def trip_length(self, payload):
+        """与 shop_standby 内部一致的口径: 买一次 + 绕开待建墙格回塔 + 1 回合余量。"""
+        planner = Planner(Turn.load(payload), payload, Memory(day=1))
+        pioneer = next(r for r in planner.turn.alive(('pioneer',)))
+        return planner.home_cost(pioneer, pioneer.pos, avoid_parking=True) + 2
+
+    def test_stays_at_the_shop_while_the_return_still_fits(self):
+        payload = self.shop_payload(rod=20)
+        trip = self.trip_length(payload)
+        payload['roundNo'] = 70 - trip - 1          # 富余 1 回合
+        planner = Planner(Turn.load(payload), payload, Memory(day=1))
+        self.assertTrue(planner.economic.shop_standby(
+            next(r for r in planner.turn.alive(('pioneer',))),
+            planner.route(next(r for r in planner.turn.alive(('pioneer',))))))
+
+    def test_leaves_the_shop_when_the_return_would_not_finish_before_dark(self):
+        payload = self.shop_payload(rod=20)
+        trip = self.trip_length(payload)
+        payload['roundNo'] = 70 - trip + 1          # 白天结束前回不到塔
+        planner = Planner(Turn.load(payload), payload, Memory(day=1))
+        pioneer = next(r for r in planner.turn.alive(('pioneer',)))
+        self.assertFalse(planner.economic.shop_standby(pioneer, planner.route(pioneer)))
+        # 交回调度后会朝武器塔移动
+        planner.run()
+        command = planner.commands.get('4')
+        self.assertIsNotNone(command, planner.commands)
+        self.assertEqual(command['action'], 'move')
+        target = Pos.load(command['targetPos'][0])
+        towers = [t.pos for t in planner.turn.weapons()]
+        self.assertLess(min(distance(target, q) for q in towers),
+                        min(distance(pioneer.pos, q) for q in towers))
+
+    def test_pioneer_is_home_before_the_day_ends(self):
+        # 从"还能站店"的最后一回合开始跑, 到第 70 回合必须在武器塔旁
+        payload = self.shop_payload(rod=20)
+        trip = self.trip_length(payload)
+        payload['roundNo'] = 70 - trip
+        memory = Memory(day=1)
+        for _ in range(trip + 2):
+            planner = Planner(Turn.load(payload), payload, memory)
+            if (payload['roundNo'] - 1) % 130 + 1 > 70:
+                break
+            planner.run()
+            for role in payload['teamOur']['roles']:
+                command = planner.commands.get(str(role['id']))
+                if command and command.get('targetPos'):
+                    role['pos'] = command['targetPos'][0]
+            payload['roundNo'] += 1
+        pioneer = next(r for r in payload['teamOur']['roles'] if r['id'] == 4)
+        towers = [(u['pos']['x'], u['pos']['y']) for u in payload['teamOur']['roles']
+                  if u['roleType'] in ('rocket', 'railgun', 'gatling')]
+        pos = Pos.load(pioneer['pos'])
+        self.assertLessEqual(min(distance(pos, Pos(*q)) for q in towers), 1,
+                             f"第70回合开拓者应已在武器塔旁, 实际 {pioneer['pos']}")
+
+    def test_buys_plan_items_once_standing_at_the_shop(self):
+        payload = self.shop_payload(rod=10)
+        planner = Planner(Turn.load(payload), payload, Memory(day=1))
+        self.assertTrue(planner.pioneer_standby())
+        command = planner.commands.get('4')
+        self.assertEqual(command['action'], 'buy', command)
+
+    def test_no_shopping_at_night(self):
+        payload = self.shop_payload(rod=85)
+        planner = Planner(Turn.load(payload), payload, Memory(day=1))
+        pioneer = next(r for r in planner.turn.alive(('pioneer',)))
+        self.assertFalse(planner.economic.shop_standby(pioneer, planner.route(pioneer)))
 
 
 class NightPrepositionTests(unittest.TestCase):

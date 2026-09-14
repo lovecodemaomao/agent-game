@@ -7,7 +7,6 @@ from agent.memory import Memory
 from agent.runtime import Agent
 from agent.protocol import Turn,Pos,distance
 from agent.tasks import Tasks
-from agent import templates
 
 
 def task_fixture():
@@ -73,7 +72,7 @@ class TaskTests(unittest.TestCase):
                 p['roundNo']=n+1;p['lastCmdResult']=''
                 p['llmResp']=llm_reply(m,kind='command',command=command,skill='复用输入解析与求解方法')
                 r=decide_response(p,m)
-                self.assertEqual(r['executeCmd'],templates.command('llm',script=command))
+                self.assertEqual(r['executeCmd'],command)
                 self.assertFalse(r['prompt'])
                 p['roundNo']=n+2;p['llmResp']='';p['lastCmdResult']=output
                 r=decide_response(p,m)
@@ -193,7 +192,7 @@ class EconomyTests(unittest.TestCase):
             if upgraded: break
         self.assertTrue(upgraded)
         # 采购一旦承诺就坚持送达并确认使用: 下单的那个角色必须完成 buy -> use
-        # (开拓者现在也会在商店旁待命并按计划买券, 所以同期可能有多笔并行采购)
+        # (开拓者也会在商店旁待命并按计划买券, 所以同期可能有多笔并行采购)
         couriers=[uid for uid,seq in per_role.items() if 'buy' in seq]
         self.assertTrue(couriers,per_role)
         self.assertEqual(per_role[couriers[0]][:2],['buy','use'],per_role)

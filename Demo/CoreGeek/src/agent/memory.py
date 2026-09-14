@@ -22,10 +22,6 @@ class Memory:
     task: dict | None = None
     task_choice: dict | None = None
     skills: list = field(default_factory=list)
-    task_stats: dict = field(default_factory=lambda: dict.fromkeys(
-        ('accepted', 'success', 'failed', 'template_hit', 'skill_hit',
-         'llm_fallback', 'rounds_total', 'llm_calls'), 0))
-    task_runs: list = field(default_factory=list)
     jobs: dict = field(default_factory=dict)
     last_commands: dict = field(default_factory=dict)
     last_roles: dict = field(default_factory=dict)
@@ -38,7 +34,6 @@ class Memory:
     levels: dict = field(default_factory=dict)         # 建筑等级快照: {unit_id: level}
     station_hit: bool = False                          # 基地是否受过伤(需求3: 触发基地升级券)
     day_start_gold: int = 0                            # 当天开始时的金币(基地券档位判断)
-    wall_rebuilds: dict = field(default_factory=dict)  # 需求5: {uid: {pos, stage, unit}} 拆墙重建
     prepositioned: set = field(default_factory=set)    # 需求4: 夜间已去下一天岗位的角色
     wall_hp: dict = field(default_factory=dict)        # 需求6: {uid: (health, max_hp)} 逐回合核对承伤
     night_wall_damage: float = 0.0                     # 需求6: 本夜围墙累计掉血
@@ -75,7 +70,6 @@ class Memory:
             self.day_weapon_upgrades = 0
             self.day_start_gold = turn.gold          # 需求3: "当天白天开始时的金币"
             self.prepositioned.clear()               # 需求4: 新的一天重新就位防守
-            self.wall_rebuilds.clear()
             # 需求6: 第3天起, 用"前一晚围墙承伤是否超过 50%"决定当天券的取向
             total = sum(self.night_wall_max.values())
             self.wall_pressure = (self.night_wall_damage/total) if total > 0 else 0.0
