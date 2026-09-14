@@ -122,7 +122,7 @@ class WallExtensionTests(unittest.TestCase):
 class WallMaintenanceTests(unittest.TestCase):
     """需求5: 第3天掉血的一级墙拆掉重建, 掉血的二级墙用修复包。"""
 
-    def level1_damaged_payload(self, day=3, health=900, rod=10):
+    def level1_damaged_payload(self, day=3, health=400, rod=10):
         sites = wall_sites(Turn.load(build_payload(day=day)))
         wall = unit(40, 'wall', sites[0].x, sites[0].y, health=health)
         p = build_payload(day=day, walls=[wall], rod=rod)
@@ -133,6 +133,12 @@ class WallMaintenanceTests(unittest.TestCase):
         p, _ = self.level1_damaged_payload()
         planner = Planner(Turn.load(p), p, Memory(day=3))
         self.assertEqual([w.unit_id for w in planner.economic.rebuild_targets()], [40])
+
+    def test_level1_wall_losing_less_than_half_is_left_alone_on_day3(self):
+        # 需求5(改): 第3天只处理掉血超过 50% 的一级墙
+        p, _ = self.level1_damaged_payload(health=800)
+        planner = Planner(Turn.load(p), p, Memory(day=3))
+        self.assertEqual(planner.economic.rebuild_targets(), [])
 
     def test_level1_damaged_wall_is_not_rebuilt_before_day3(self):
         p, _ = self.level1_damaged_payload(day=2)
@@ -188,7 +194,7 @@ class WallMaintenanceTests(unittest.TestCase):
 
     def test_level2_damaged_wall_is_repaired_with_fixer_on_day3(self):
         sites = wall_sites(Turn.load(build_payload(day=3)))
-        wall = unit(40, 'wall', sites[0].x, sites[0].y, health=1400, level=2)
+        wall = unit(40, 'wall', sites[0].x, sites[0].y, health=700, level=2)   # 2级满血1500, 掉血过半
         p = build_payload(day=3, walls=[wall])
         p['teamOur']['roles'][1]['pos'] = {'x': sites[0].x - 1, 'y': sites[0].y}
         p['teamOur']['roles'][1]['backpack'] = ['WallFixer']
@@ -239,14 +245,22 @@ class NightPrepositionTests(unittest.TestCase):
         planner = Planner(Turn.load(p), p, m)
         self.assertFalse(planner.night_battle_over())
 
-    def test_worker_stays_before_the_last_night_rounds(self):
-        # 场上仍有机器人(虽离炮位远)且未到夜末 -> 不提前离开炮位
+    def test_distant_wandering_robot_does_not_block_night_actions(self):
+        # 阵前已清空(只剩远处游走的机器人) -> 立刻行动, 不再干等到夜末
         p = self.night_payload(rod=100, robots=[robot(9, 38, 2)])
+        m = Memory(day=1)
+        planner = Planner(Turn.load(p), p, m)
+        self.assertTrue(planner.night_battle_over(), '远处机器人不算阵前威胁')
+        worker = [w for w in planner.turn.workers() if w.unit_id == 2][0]
+        self.assertTrue(planner.preposition(worker), '阵前清空后应当立刻去下一天岗位')
+
+    def test_robot_inside_threat_radius_keeps_everyone_on_defense(self):
+        p = self.night_payload(rod=100, robots=[robot(1, 12, 25)])
         m = Memory(day=1)
         planner = Planner(Turn.load(p), p, m)
         self.assertFalse(planner.night_battle_over())
         worker = [w for w in planner.turn.workers() if w.unit_id == 2][0]
-        self.assertFalse(planner.preposition(worker), '夜里前段仍应守炮位')
+        self.assertFalse(planner.preposition(worker), '阵前有敌时先守炮位')
 
     def test_worker_leaves_in_the_last_night_rounds(self):
         p = self.night_payload(rod=126)

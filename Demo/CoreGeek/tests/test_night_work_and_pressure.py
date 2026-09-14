@@ -14,8 +14,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_strategy import fixture, unit
 from test_rule45_walls_night import build_payload, robot
-from test_task_templates import ENGINEER_DESC, task_payload
+from test_tasks_economy import task_fixture
 from agent.brain import Planner, decide_response, wall_sites
+
+ENGINEER_DESC = '''进入 %s 目录，修复以下问题：
+1. 创建 logs/alpha 目录
+2. 修改 `config/alpha.conf` 第3行为 `port 8080`
+3. 设置 bin/start.sh 可执行权限
+4. 运行 ./check 验证并获取 TOKEN'''
+
+
+def task_payload(desc, root='/tmp/selfEvolutionTask/x/ws_1/'):
+    """带任务点的载荷: 开拓者(4)紧贴任务点(13,26), phaseTask 已生效。"""
+    p = task_fixture()
+    p['phaseTask'] = desc % root if '%s' in desc else desc
+    return p
 from agent.memory import Memory, WALL_PRESSURE_DAY, WALL_PRESSURE_RATIO
 from agent.protocol import Pos, Turn, distance
 from agent.tasks import Tasks
@@ -58,19 +71,39 @@ class NightWorkTests(unittest.TestCase):
         for uid, command in planner.commands.items():
             self.assertNotEqual(command['action'], 'collect', (uid, command))
 
-    def test_pioneer_can_solve_the_task_at_night(self):
-        # 夜战结束后: 开拓者在任务点旁直接执行预设命令(此前夜间被 returning 挡住)
-        desc = ENGINEER_DESC % '/tmp/selfEvolutionTask/x/ws_1/'
-        p = task_payload(desc)
-        p['roundNo'] = 130                     # 第1天夜里(无机器人 -> 战斗结束)
-        m = Memory(day=1)
-        response = decide_response(p, m)
-        self.assertIn('check', response['executeCmd'], response)
-        self.assertIsNotNone(m.task)
+    def test_pioneer_solves_the_whole_task_at_night(self):
+        # 夜战结束后整条任务链都能在夜间跑完: 读上下文 -> 修复模板 -> 提交答案(零 LLM)
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from test_task_templates import engineering, execute
+        from agent import templates as T
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            name = engineering(root, 'alpha', 1, json_token=False)
+            p = task_payload('请阅读 ' + name + '，获取任务信息')
+            p['roundNo'] = 130                 # 第1天夜里(无机器人 -> 战斗结束)
+            m = Memory(day=1)
+            with patch.object(T, 'TASK_DIR', str(root)):
+                first = decide_response(p, m)
+            self.assertTrue(first['executeCmd'], '夜间也应当执行任务命令')
+            p['lastCmdResult'] = execute(first['executeCmd'])
+            p['roundNo'] += 1
+            with patch.object(T, 'TASK_DIR', str(root)):
+                second = decide_response(p, m)
+            self.assertTrue(second['executeCmd'], '第二轮应当给出修复模板')
+            p['lastCmdResult'] = execute(second['executeCmd'])
+            p['roundNo'] += 1
+            with patch.object(T, 'TASK_DIR', str(root)):
+                third = decide_response(p, m)
+            command = third['roleCommandMap'].get('4')
+            self.assertIsNotNone(command, third)
+            self.assertEqual(command['action'], 'submitAnswer')
+            self.assertEqual(command['taskAnswer'], 'fresh-alpha-1')
+            self.assertEqual(m.task_stats['llm_calls'], 0)
 
     def test_night_task_work_stops_when_robots_return(self):
-        desc = ENGINEER_DESC % '/tmp/selfEvolutionTask/x/ws_1/'
-        p = task_payload(desc)
+        p = task_payload('请阅读 task_1_alpha.md，获取任务信息')
         p['roundNo'] = 130
         p['robot'] = {'roles': [robot(1, 12, 25)]}      # 机器人就在开拓者身边
         m = Memory(day=1)

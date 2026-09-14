@@ -28,7 +28,7 @@ SPEND_TRIP_SLACK=3                        # 清钱时点余量(回合)
 STATION_FALLBACK_HP=1000                  # 保留: 旧兜底阈值(现由"受伤即优先"取代)
 STATION_FALLBACK_DAY=4                    # 保留: 旧兜底天数
 WALL_MAINTENANCE_DAY=3                   # 需求5: 第3天起掉血的墙要重建/修复
-NIGHT_PREPOSITION_ROUND=124               # 需求4: 夜末若干回合开始为下一天预置站位
+DAY3_WALL_DAMAGE_RATIO=0.5               # 需求5(改): 第3天只看"掉血超过 50%"的墙
 STATION_URGENT_DAY=3                      # 需求3: 第3天起, 基地一受伤就优先买基地升级券
 STATION_TIER2_GOLD=150                    # 需求3: 白天开始时金币>150 且已2级 -> 直接上2级券
 FRONT_REPAIR_RATIO=0.7                    # 面向机器人的前排墙: 血量低于该比例即主动修复
@@ -48,9 +48,9 @@ class Economy:
         return DAY_PLAN.get(self.m.day or ((self.turn.round_no-1)//130+1), DAY_PLAN_DEFAULT)
 
     def repair_threshold(self,wall):
-        """围墙修复阈值: 第1-2天只有明显受损才修; 第3天起"掉一格血就算受损"(需求5)。"""
+        """围墙修复阈值: 第1-2天只有明显受损才修; 第3天起只看掉血超过 50% 的墙(需求5改)。"""
         if (self.m.day or ((self.turn.round_no-1)//130+1))>=WALL_MAINTENANCE_DAY:
-            return 1.0
+            return DAY3_WALL_DAMAGE_RATIO
         return FRONT_REPAIR_RATIO if wall.pos in self.p.walls else ANY_REPAIR_RATIO
 
     def damaged_walls(self):
@@ -62,14 +62,17 @@ class Economy:
         return out
 
     def rebuild_targets(self):
-        """需求5: 第3天起, 掉血的一级墙拆掉重建(石头免费, 重建即回满血)。"""
+        """需求5(改): 第3天起, 掉血超过 50% 的一级墙拆掉重建(石头免费, 重建即回满血)。
+
+        掉血不到一半的一级墙不动它 —— 重建会白白吃掉一块石头和一个回合。
+        """
         if not self.turn.is_day: return []
         if (self.m.day or ((self.turn.round_no-1)//130+1))<WALL_MAINTENANCE_DAY: return []
         planned={j.get('unit') for j in self.m.jobs.values() if j.get('type')=='upgrade'}
         out=[]
         for w in self.turn.walls():
             if max(1,min(3,w.level))!=1: continue
-            if w.health>=HP['wall'][0]: continue
+            if w.health>=HP['wall'][0]*DAY3_WALL_DAMAGE_RATIO: continue
             if w.pos not in self.p.walls: continue
             if w.unit_id in planned: continue        # 正在被升级券回血的墙不重建
             out.append(w)
@@ -141,9 +144,9 @@ class Economy:
             front = u.kind=='wall' and u.pos in self.p.walls
             # 主动防御修复: 面向机器人的前排墙血量<70% 即修(不等被打爆), 其余墙<50% 才修;
             # 手上已有修复包 -> 最高优先级(不花金币); 需现买则排在武器/围墙升级之后。
-            if u.kind=='wall' and level==1 and ratio<1.0 and self.turn.is_day \
+            if u.kind=='wall' and level==1 and ratio<DAY3_WALL_DAMAGE_RATIO and self.turn.is_day \
                     and (self.m.day or ((self.turn.round_no-1)//130+1))>=WALL_MAINTENANCE_DAY:
-                continue        # 需求5: 掉血的一级墙改用"拆掉重建"(石头), 不占用修复包/升级券
+                continue        # 需求5: 掉血过半的一级墙改用"拆掉重建"(石头), 不占用修复包/升级券
             if u.kind=='wall' and ratio < self.repair_threshold(u) \
                     and (level>=3 or held_fixer):
                 # 手上没修复包时按严重度: 濒临被打爆(<25%)优先于武器升级, 否则排在升级之后
@@ -235,7 +238,7 @@ class Economy:
             targets=sum(u.health>0 and u.kind in kinds.get(prefix,()) and u.level==int(level)
                         and u.unit_id not in assigned
                         and not (prefix=='Wall' and int(level)==1
-                                 and u.health<HP['wall'][0] and self.turn.is_day
+                                 and u.health<HP['wall'][0]*DAY3_WALL_DAMAGE_RATIO and self.turn.is_day
                                  and (self.m.day or ((self.turn.round_no-1)//130+1))>=WALL_MAINTENANCE_DAY)
                         for u in self.turn.ours)
             held=sum(r.backpack.count(item) for r in self.turn.controllable())

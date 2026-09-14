@@ -1,552 +1,280 @@
-"""任务执行效率(自动定位/预设模板/立即提交/死线管理) + 三条战术要求的回归测试。
-
-1. 修复部署类: 一条命令建目录/改配置/加权限/去 Windows 回车/跑检查, 并从输出直接取 TOKEN
-2. 查询类: 一条命令试完 鉴权头 x 参数名 组合并翻页取全量, 依据记录直接算出答案
-3. 死线管理: 剩余时限不够时不接任务
-4. 人物不得占用待建围墙格(会在那一圈站住导致建不了墙)
-5. 开拓者无任务时去商店旁待命并按计划买券, 天黑前回武器塔
-6. 第3天之后基地受伤 -> 当天第一优先级是基地升级券
-"""
+"""Real file-only tasks, executing generated commands against local fixtures."""
+import contextlib
 import json
 import os
-import shutil
-import stat
+from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
-import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_strategy import fixture, unit
+sys.path[:0] = [str(Path(__file__).resolve().parents[1] / 'src'), str(Path(__file__).resolve().parent)]
 from agent import templates
-from agent.brain import Planner, decide_response, wall_sites
+from agent.brain import decide_response
 from agent.memory import Memory
-from agent.protocol import Pos, Turn, distance
-from agent.tasks import Tasks
-
-SHELL = '/bin/zsh' if os.path.exists('/bin/zsh') else '/bin/sh'
-
-ENGINEER_DESC = '''进入 %s 目录，修复以下问题：
-1. 创建 logs/alpha 目录
-2. 修改 `config/alpha.conf` 第3行为 `port 8080`
-3. 修改 `config/alpha.conf` 第6行为 `name alpha-app`
-4. 设置 bin/start.sh 可执行权限
-5. 去除 check 脚本的 Windows 回车符 (\\r)
-6. 运行 ./check 验证并获取 TOKEN'''
-
-API_DESC = ('【自进化任务】读取 /tmp/selfEvolutionTask/1-fixed-step/1-api-query/ws_1/task_1_beijing.md，'
-            '调用 {base}/api/v1/heritage/search 查询北京市全部文化遗产记录，'
-            '其中保护级别为“世界遗产”的数量需单独统计；'
-            '按要求提交 `city`、`total_count`、`world_heritage_count`、`types`、`oldest_era`。')
-
-RECORDS = [
-    {'name': '故宫', 'city': '北京', 'protection_level': '世界遗产', 'type': '古建筑', 'era': '明清'},
-    {'name': '长城', 'city': '北京', 'protection_level': '世界遗产', 'type': '古建筑', 'era': '明清'},
-    {'name': '周口店遗址', 'city': '北京', 'protection_level': '世界遗产', 'type': '古遗址', 'era': '旧石器'},
-    {'name': '天坛', 'city': '北京', 'protection_level': '世界遗产', 'type': '古建筑', 'era': '明清'},
-    {'name': '颐和园', 'city': '北京', 'protection_level': '世界遗产', 'type': '古建筑', 'era': '清'},
-    {'name': '明十三陵', 'city': '北京', 'protection_level': '世界遗产', 'type': '古墓葬', 'era': '明'},
-    {'name': '卢沟桥', 'city': '北京', 'protection_level': '国家级', 'type': '古建筑', 'era': '金'},
-    {'name': '潭柘寺', 'city': '北京', 'protection_level': '国家级', 'type': '古建筑', 'era': '晋'},
-    {'name': '戒台寺', 'city': '北京', 'protection_level': '国家级', 'type': '古建筑', 'era': '隋'},
-    {'name': '云居寺', 'city': '北京', 'protection_level': '国家级', 'type': '古建筑', 'era': '唐'},
-    {'name': '法源寺', 'city': '北京', 'protection_level': '国家级', 'type': '古建筑', 'era': '唐'},
-    {'name': '雍和宫', 'city': '北京', 'protection_level': '国家级', 'type': '古建筑', 'era': '清'},
-    {'name': '大觉寺', 'city': '北京', 'protection_level': '国家级', 'type': '古建筑', 'era': '辽'},
-    {'name': '红螺寺', 'city': '北京', 'protection_level': '国家级', 'type': '古建筑', 'era': '唐'},
-    {'name': '琉璃河遗址', 'city': '北京', 'protection_level': '国家级', 'type': '古遗址', 'era': '西周'},
-]
-EXPECTED_TYPES = ['古建筑', '古遗址', '古墓葬']
+from agent.task_sandbox import fingerprint
+from test_tasks_economy import task_fixture, llm_reply
+from test_strategy import unit
 
 
-def run_shell(command):
-    return subprocess.run([SHELL, '-c', command], capture_output=True,
-                          encoding='utf-8', errors='replace', timeout=60)
+def execute(command):
+    # Linux runs the exact shell command handed to the judge. Windows exercises
+    # the identical encoded Python program without relying on a shell install.
+    argv = ['sh', '-c', command] if os.name != 'nt' else [sys.executable, *shlex.split(command)[1:]]
+    result = subprocess.run(argv, capture_output=True, timeout=14)
+    if result.returncode:
+        raise AssertionError('Fixture command failed: ' + result.stderr.decode('utf-8', 'replace')[-500:])
+    return result.stdout.decode('utf-8')
 
 
-def write_workspace(root):
-    """搭一个和比赛环境同形的任务工作区: 配置待改、start.sh 无执行位、check 带 CRLF。"""
-    ws = Path(root) / 'ws_1'
-    (ws / 'config').mkdir(parents=True)
-    (ws / 'bin').mkdir(parents=True)
-    conf = ws / 'config' / 'alpha.conf'
-    conf.write_text('server\nmode dev\nport 9090\nnamespace demo\nlog info\nname alpha-dev\n')
-    start = ws / 'bin' / 'start.sh'
-    start.write_text('#!/bin/sh\necho started\n')
-    start.chmod(0o644)
-    check = ws / 'check'
-    body = ('#!/bin/sh\nok=1\n'
-            '[ -d logs/alpha ] || ok=0\n'
-            '[ "$(sed -n 3p config/alpha.conf)" = "port 8080" ] || ok=0\n'
-            '[ "$(sed -n 6p config/alpha.conf)" = "name alpha-app" ] || ok=0\n'
-            '[ -x bin/start.sh ] || ok=0\n'
-            'if [ $ok -eq 1 ]; then\n'
-            '  echo "[ OK ] 全部通过 (6/6)"\n'
-            '  echo "TOKEN: fc1e78eb2a5a"\n'
-            'else\n'
-            '  echo "[FAIL]"\n'
-            'fi\n')
-    check.write_bytes(body.replace('\n', '\r\n').encode())     # Windows 回车
-    (ws / 'task_1_alpha.md').write_text(ENGINEER_DESC % str(ws))
-    return ws
+def engineering(root, label, number, json_token=False, fail=False):
+    workspace = root / ('ws_' + str(number))
+    (workspace / 'config').mkdir(parents=True)
+    (workspace / 'bin').mkdir()
+    config = 'config/' + label + '.conf'
+    (workspace / config).write_text('PORT=0\nAPP=old\n', encoding='utf-8')
+    (workspace / 'bin/start.sh').write_bytes(b'#!/bin/sh\r\necho start\r\n')
+    port = 8000 + number * 100
+    (workspace / 'spec.md').write_text(
+        f'{config} 第1行改为 PORT={port}\n{config} 第2行改为 APP={label}-svc\n'
+        f'创建目录 logs/{label}\n修复 bin/start.sh 的CRLF并赋执行权限\n运行 check\n', encoding='utf-8')
+    checker = ("#!/usr/bin/env python3\nfrom pathlib import Path\nimport os\n"
+               f"assert Path({config!r}).read_text() == 'PORT={port}\\nAPP={label}-svc\\n'\n"
+               f"assert Path('logs/{label}').is_dir()\n"
+               "assert b'\\r' not in Path('bin/start.sh').read_bytes()\n"
+               "assert os.name == 'nt' or os.access('bin/start.sh', os.X_OK)\n"
+               + ("raise SystemExit(1)\n" if fail else f"print('TOKEN: fresh-{label}-{number}')\n"))
+    (workspace / 'check').write_bytes(checker.replace('\n', '\r\n').encode())
+    filename = f'task_{number}_{label}.md'
+    (root / filename).write_text(f'请修复 ws_{number}，依据 spec.md 运行 check。\n' +
+                               ('提交格式：{"token":"..."}' if json_token else '提交裸 TOKEN'), encoding='utf-8')
+    return filename
 
 
-class EngineerTemplateTests(unittest.TestCase):
-    def setUp(self):
-        self.root = tempfile.mkdtemp(prefix='taskws-')
-        self.ws = write_workspace(self.root)
-        self.desc = ENGINEER_DESC % (str(self.ws) + '/')
+@contextlib.contextmanager
+def api_server(count=12, ignore=False, pagination='pageNo', auth='X-API-Key'):
+    calls = []
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            query = parse_qs(urlsplit(self.path).query)
+            calls.append(query)
+            if self.headers.get(auth) != ('Bearer fixture-secret' if auth == 'Authorization' else 'fixture-secret'):
+                self.send_response(401); self.end_headers(); return
+            city = query.get('city', [''])[0]
+            page = int(query.get(pagination, ['1'])[0])
+            start = 0 if ignore else (page-1)*100
+            rows = [{'id':i, 'city':city, 'name':'record-'+str(i), 'type':'A' if i%2 else 'B',
+                     'world_heritage':i%3 == 0, 'era':'早' if i%5 else '晚', 'notes':'文'*200}
+                    for i in range(start, min(start+100, count))]
+            body = json.dumps({'total':count, 'records':rows}, ensure_ascii=False).encode()
+            self.send_response(200); self.send_header('Content-Length', str(len(body)))
+            self.end_headers(); self.wfile.write(body)
+        def log_message(self, *_):
+            pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f'http://127.0.0.1:{server.server_port}/api/records/search', calls
+    finally:
+        server.shutdown(); server.server_close(); thread.join()
 
-    def tearDown(self):
-        shutil.rmtree(self.root, ignore_errors=True)
 
-    def test_parses_steps_into_single_command(self):
-        command = templates.engineer_command(self.desc)
-        self.assertIn('mkdir -p logs/alpha', command)
-        self.assertIn("'3s|.*|port 8080|'", command)
-        self.assertIn("'6s|.*|name alpha-app|'", command)
-        self.assertIn('chmod 755 bin/start.sh', command)
-        # 关键: 跑检查脚本之前必须先去 Windows 回车
-        self.assertIn("sed -i.bak 's/\\r$//' check", command)
-        self.assertLess(command.index("sed -i.bak 's/\\r$//' check"),
-                        command.index('sh ./check'))
-        self.assertEqual(templates.estimate(self.desc), templates.ENGINEER_ROUNDS)
+def api_files(root, city, url, auth='X-API-Key', schema=None):
+    schema = schema or {'city':'', 'total_count':0, 'world_heritage_count':0, 'types':[], 'oldest_era':''}
+    name = 'task_1_city.md'
+    (root/name).write_text(f'查询{city}文化遗产，详见 API_DOCS.md。\n提交格式：'+json.dumps(schema,ensure_ascii=False),encoding='utf-8')
+    (root/'API_DOCS.md').write_text(f'GET {url}?city=<city>\n参数 city\n'
+        f'{auth}: '+('Bearer ' if auth=='Authorization' else '')+'fixture-secret\n'
+        '分页参数 pageNo\nera_order: ["早", "晚"]\n',encoding='utf-8')
+    return name
 
-    def test_check_script_has_crlf_so_stripping_is_required(self):
-        naive = templates.engineer_command(self.desc).replace(
-            "sed -i.bak 's/\\r$//' check", 'true')
-        output = run_shell(naive).stdout
-        self.assertNotIn('TOKEN', output, '未去 CR 的检查脚本不应通过(证明用例有区分度)')
 
-    def test_preset_command_fixes_and_returns_token_in_one_round(self):
-        result = run_shell(templates.engineer_command(self.desc))
-        self.assertIn('[ OK ] 全部通过 (6/6)', result.stdout)
-        self.assertIn('CHECK_EXIT=0', result.stdout)
-        self.assertTrue((self.ws / 'logs' / 'alpha').is_dir())
-        self.assertTrue((self.ws / 'bin' / 'start.sh').stat().st_mode & stat.S_IXUSR)
-        self.assertEqual(templates.derive_answer(self.desc, '', result.stdout), 'fc1e78eb2a5a')
+class TaskTemplateTests(unittest.TestCase):
+    def start(self, root, filename, memory=None):
+        p = task_fixture()
+        p['phaseTask'] = '请阅读 ' + filename + '，获取任务信息'
+        p['teamOur']['roles'].append(unit(2, 'worker', 9, 24))
+        m = memory or Memory()
+        with patch.object(templates, 'TASK_DIR', str(root)):
+            response = decide_response(p, m)
+        self.assertTrue(response['executeCmd'])
+        self.assertFalse(response['prompt'])
+        # The task holds only the pioneer; the worker continues construction.
+        self.assertIn('2', response['roleCommandMap'])
+        self.assertNotIn('4', response['roleCommandMap'])
+        return p, m, response
 
-    def test_task_finishes_in_two_rounds_without_llm(self):
-        """任务生效 -> 一条预设命令 -> 结果即答案 -> 立刻提交(共 2 回合, 0 次 LLM)。"""
-        payload = task_payload(self.desc)
+    def next(self, p, m, response):
+        p['lastCmdResult'] = execute(response['executeCmd'])
+        self.assertLess(len(p['lastCmdResult'].encode()), 64000)
+        p['roundNo'] += 1
+        p['llmResp'] = ''
+        return decide_response(p, m)
+
+    def test_file_only_engineering_alpha_beta_gamma_and_skill_regeneration(self):
+        signatures = []
+        skills = []
+        for number, label in enumerate(('alpha', 'beta', 'gamma'), 1):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                name = engineering(root, label, number, json_token=number%2 == 0)
+                m = Memory(skills=list(skills))
+                p, m, first = self.start(root, name, m)
+                second = self.next(p, m, first)
+                self.assertTrue(second['executeCmd'])
+                self.assertFalse(second['prompt'])
+                signatures.append(m.task['signature']['family'])
+                third = self.next(p, m, second)
+                answer = third['roleCommandMap']['4']['taskAnswer']
+                expected = f'fresh-{label}-{number}'
+                self.assertEqual(json.loads(answer)['token'] if number%2 == 0 else answer, expected)
+                self.assertFalse(third['prompt'] or third['executeCmd'])
+                self.assertEqual(m.task_stats['llm_calls'], 0)
+                p['phaseTask']=''; p['roundNo']+=1
+                p['teamOur']['playerTasks'][0]['isValid']=False
+                decide_response(p,m)
+                self.assertEqual(m.task_stats['success'],1)
+                self.assertEqual(m.task_runs[-1]['commands'],2)
+                self.assertNotIn('command',m.skills[-1])
+                self.assertNotIn('answer',m.skills[-1])
+                if number > 1 and number%2 == 1:
+                    self.assertGreater(m.task_stats['skill_hit'],0)
+                skills = m.skills
+        self.assertEqual(signatures,['deployment_fix']*3)
+
+    def test_file_only_api_cities_auth_and_500_records(self):
+        signatures = []
+        for city, auth in (('北京','X-API-Key'),('南京','Authorization'),('成都','X-API-Key')):
+            with self.subTest(city=city), tempfile.TemporaryDirectory() as tmp, api_server(550,auth=auth) as (url,calls):
+                root=Path(tmp); name=api_files(root,city,url,auth)
+                p,m,first=self.start(root,name)
+                second=self.next(p,m,first)
+                self.assertTrue(second['executeCmd']); self.assertFalse(second['prompt'])
+                signatures.append(m.task['signature'])
+                third=self.next(p,m,second)
+                answer=json.loads(third['roleCommandMap']['4']['taskAnswer'])
+                self.assertEqual(answer,{'city':city,'total_count':550,'world_heritage_count':184,'types':['A','B'],'oldest_era':'早'})
+                self.assertEqual(len(calls),6)
+                self.assertLess(len(p['lastCmdResult'].encode()),1000)
+                self.assertEqual(m.task_stats['llm_calls'],0)
+        self.assertTrue(all(sig==signatures[0] for sig in signatures))
+
+    def test_ignored_pagination_deduplicates_and_refuses_partial_answer(self):
+        with tempfile.TemporaryDirectory() as tmp, api_server(550,ignore=True) as (url,calls):
+            root=Path(tmp);name=api_files(root,'成都',url)
+            p,m,first=self.start(root,name)
+            second=self.next(p,m,first)
+            third=self.next(p,m,second)
+            self.assertIn('"unique": 100',p['lastCmdResult'])
+            self.assertNotIn('__ANSWER ',p['lastCmdResult'])
+            self.assertNotIn('4',third['roleCommandMap'])
+            self.assertTrue(third['prompt'])
+            self.assertLessEqual(len(calls),11)
+
+    def test_checker_failure_falls_back_once_and_llm_token_submits_next_round(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);name=engineering(root,'delta',4,fail=True)
+            p,m,first=self.start(root,name)
+            second=self.next(p,m,first)
+            third=self.next(p,m,second)
+            self.assertTrue(third['prompt']);self.assertFalse(third['executeCmd'])
+            self.assertNotIn('4',third['roleCommandMap'])
+            p['roundNo']+=1
+            p['llmResp']=llm_reply(m,kind='command',command='printf "TOKEN: fresh-llm\\n"',skill='fix checker inputs')
+            fourth=decide_response(p,m)
+            self.assertEqual(fourth['executeCmd'],templates.command('llm',script='printf "TOKEN: fresh-llm\\n"'))
+            p['roundNo']+=1;p['llmResp']='';p['lastCmdResult']='TOKEN: fresh-llm'
+            fifth=decide_response(p,m)
+            self.assertEqual(fifth['roleCommandMap']['4']['taskAnswer'],'fresh-llm')
+            self.assertFalse(fifth['prompt'] or fifth['executeCmd'])
+            self.assertEqual(m.task_stats['template_hit'],1)
+
+    def test_context_is_bounded_and_does_not_submit_document_examples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            (root/'task_x.md').write_text('TOKEN: example\n__ANSWER "example"\n'+'文'*50000,encoding='utf-8')
+            with patch.object(templates,'TASK_DIR',str(root)):
+                output=execute(templates.locate_command('请阅读 task_x.md'))
+            self.assertLess(len(output.encode()),48000)
+            self.assertIn('__CONTEXT_COMPLETE__ false',output)
+            self.assertIsNone(templates.derive_answer('提交TOKEN',output,output))
+
+    def test_ambiguous_file_fails_instead_of_reading_another_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            for folder in ('a','b'):
+                (root/folder).mkdir();(root/folder/'task_x.md').write_text('unrelated',encoding='utf-8')
+            with patch.object(templates,'TASK_DIR',str(root)):
+                output=execute(templates.locate_command('请阅读 task_x.md'))
+            self.assertIn('__TASK_ERROR',output)
+            self.assertNotIn('__DOC_BEGIN__',output)
+
+    def test_failed_truncated_ambiguous_and_schema_mismatched_answers(self):
+        for result in ('TOKEN: abc\nCHECK_EXIT=1','__ANSWER {"wrong":1}',
+                       'TOKEN: one\nTOKEN: two','TOKEN: abc\n[exitCode:2]',
+                       'TOKEN: abc\ntruncated','__ANSWER "old"\n__ANSWER "new"'):
+            with self.subTest(result=result):
+                self.assertIsNone(templates.derive_answer('提交格式：{"token":"..."}','',result))
+
+    def test_fingerprint_precedence_and_unidentified_rows(self):
+        self.assertEqual(fingerprint({'id':1,'name':'a'}),fingerprint({'id':1,'name':'b'}))
+        self.assertEqual(fingerprint({'a':1,'b':2}),fingerprint({'b':2,'a':1}))
+
+    def test_known_round_estimate_and_unknown_point_label(self):
+        self.assertEqual(templates.estimate_task_rounds('自进化类1'),20)
+        self.assertEqual(templates.estimate_task_rounds('请阅读 task_1_alpha.md'),6)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);name=engineering(root,'epsilon',5)
+            with patch.object(templates,'TASK_DIR',str(root)):
+                output=execute(templates.locate_command('请阅读 '+name))
+            self.assertEqual(templates.estimate_task_rounds('请阅读 '+name,output),2)
+
+
+class MergedEngineExtrasTests(unittest.TestCase):
+    """合并 PR#12 之后补回来的回归: 接单死线闸门 / 文档型单接口模板 / 城市占位符。"""
+
+    def test_offer_with_too_little_time_left_is_skipped(self):
+        p = task_fixture()
+        p['phaseTask'] = ''
+        p['teamOur']['playerTasks'][0]['timeoutRounds'] = 2      # 只剩 2 回合
         memory = Memory()
-        first = decide_response(payload, memory)
-        self.assertIsNotNone(memory.task, memory.trace)
-        self.assertIn('mkdir -p logs/alpha', first['executeCmd'])
-        self.assertNotIn('logs/alpha', first['prompt'])
-        self.assertEqual(memory.llm_used, 0)
-        payload['roundNo'] = 2
-        payload['lastCmdResult'] = ('[exitCode:0]\n[ OK ] 全部通过 (6/6)\n'
-                                    'TOKEN: fc1e78eb2a5a')
-        second = decide_response(payload, memory)
-        command = second['roleCommandMap']['4']
-        self.assertEqual(command['action'], 'submitAnswer')
-        self.assertEqual(command['taskAnswer'], 'fc1e78eb2a5a')
-        self.assertEqual(second['prompt'], '')
-
-
-class ApiTemplateTests(unittest.TestCase):
-    server = None
-    requests = []
-
-    @classmethod
-    def setUpClass(cls):
-        cls.requests = []
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                ApiTemplateTests.requests.append(dict(self.headers))
-                if not self.path.startswith('/api/v1/heritage/search'):
-                    self.send_error(404)
-                    return
-                if self.headers.get('Authorization') != 'Bearer heritage-api-key-2024':
-                    self.send_error(401)
-                    return
-                query = self.path.split('?', 1)[1] if '?' in self.path else ''
-                if 'location=' not in query and 'city=' not in query:
-                    self.send_error(400)
-                    return
-                body = json.dumps({'code': 0, 'data': {'records': RECORDS}},
-                                  ensure_ascii=False).encode()
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json; charset=utf-8')
-                self.send_header('Content-Length', str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *args):
-                return
-
-        cls.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
-        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.server.shutdown()
-
-    def setUp(self):
-        ApiTemplateTests.requests = []
-        self.base = 'http://127.0.0.1:%d' % self.server.server_address[1]
-        self.desc = API_DESC.format(base=self.base)
-
-    def test_command_tries_auth_and_param_combinations(self):
-        command = templates.api_command(self.desc, '')
-        self.assertIsNotNone(command)
-        self.assertIn('BASE=', command)
-        self.assertIn('PATHS=', command)
-        self.assertEqual(templates.estimate(self.desc), templates.API_ROUNDS)
-
-    def test_harvest_uses_bearer_auth_and_location_param(self):
-        result = run_shell(templates.api_command(self.desc, ''))
-        harvest = templates.parse_harvest(result.stdout)
-        self.assertIsNotNone(harvest, result.stdout)
-        self.assertEqual(harvest['status'], 'OK')
-        self.assertEqual(harvest['auth'], 'Authorization')      # 预置正确鉴权头
-        self.assertEqual(harvest['param'], 'location')          # 预置正确参数名
-        self.assertEqual(harvest['count'], len(RECORDS))
-        self.assertTrue(any('Bearer heritage-api-key-2024' in str(h)
-                            for h in ApiTemplateTests.requests))
-
-    def test_answer_derived_from_records_without_llm(self):
-        result = run_shell(templates.api_command(self.desc, ''))
-        answer = json.loads(templates.derive_answer(self.desc, '', result.stdout))
-        self.assertEqual(answer['city'], '北京')
-        self.assertEqual(answer['total_count'], len(RECORDS))
-        self.assertEqual(answer['world_heritage_count'], 6)
-        self.assertEqual(answer['types'], EXPECTED_TYPES)
-        self.assertEqual(answer['oldest_era'], '周口店遗址')
-
-    def test_task_submits_derived_answer_in_two_rounds(self):
-        payload = task_payload(self.desc)
-        memory = Memory()
-        first = decide_response(payload, memory)
-        self.assertIn('harvest.py', first['executeCmd'])
-        payload['roundNo'] = 2
-        payload['lastCmdResult'] = run_shell(templates.api_command(self.desc, '')).stdout
-        second = decide_response(payload, memory)
-        command = second['roleCommandMap']['4']
-        self.assertEqual(command['action'], 'submitAnswer')
-        answer = json.loads(command['taskAnswer'])
-        self.assertEqual(answer['world_heritage_count'], 6)
-        self.assertEqual(second['prompt'], '', '记录已足够作答时不应再请求 LLM')
-
-    def test_unprovable_schema_falls_back_to_llm(self):
-        records = [{'name': '甲', 'city': '北京', 'protection_level': '世界遗产',
-                    'type': '古建筑', 'era': '唐'}]
-        # 未知字段 -> 不硬猜, 交给 LLM
-        self.assertIsNone(templates.answer_from_harvest(['mystery_field'], records, '北京', '题干'))
-        # *_count 的定语在题干里找不到对应取值 -> 不硬猜
-        self.assertIsNone(templates.answer_from_harvest(['dragon_count'], records, '北京', '题干'))
-        # 记录不是字典(接口返回裸值) -> 不硬猜
-        self.assertIsNone(templates.answer_from_harvest(['total_count'], [1, 2, 3], '北京', '题干'))
-
-
-class DocQueryTests(unittest.TestCase):
-    """题干自带接口文档(GET url?city=<城市名>)的任务: 按文档原样调用一次, 不猜参数。"""
-
-    server = None
-
-    @classmethod
-    def setUpClass(cls):
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                query = self.path.split('?', 1)[1] if '?' in self.path else ''
-                params = dict(p.split('=', 1) for p in query.split('&') if '=' in p)
-                city = urllib.parse.unquote(params.get('city', ''))
-                body = json.dumps({'city': city, 'weather': '阴'}, ensure_ascii=False).encode()
-                self.send_response(200 if city else 400)
-                self.send_header('Content-Type', 'application/json; charset=utf-8')
-                self.send_header('Content-Length', str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *args):
-                return
-
-        cls.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
-        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.server.shutdown()
-
-    def setUp(self):
-        base = 'http://127.0.0.1:%d' % self.server.server_address[1]
-        self.desc = ('【自进化任务】请查询成都今天的天气并提交答案。\n'
-                     '第三方天气API文档：GET %s/weather?city=<城市名>\n'
-                     '返回 JSON：{"city": "...", "weather": "..."}\n'
-                     '完成后调用 submitAnswer，答案中需包含该城市的天气现象。' % base)
-
-    def test_documented_call_is_not_mistaken_for_record_harvest(self):
-        # 单对象接口(不是记录列表) -> 不走采集模板, 避免白花一个回合
-        self.assertIsNone(templates.api_command(self.desc, ''))
-        command = templates.doc_query_command(self.desc, '')
-        self.assertIsNotNone(command)
-        self.assertTrue(command.startswith('curl -s -G "'))
-        self.assertIn('--data-urlencode "city=成都"', command)
-        self.assertLessEqual(templates.estimate(self.desc), templates.API_ROUNDS)
-
-    def test_documented_call_reaches_api_in_one_round(self):
-        result = run_shell(templates.doc_query_command(self.desc, ''))
-        self.assertIn('成都', result.stdout)
-        self.assertIn('阴', result.stdout)
-
-    def test_successful_preset_result_skips_the_probe_phase(self):
-        # 预设调用已经拿到数据 -> 不再花 3 个回合做目录探测, 直接进入知识 prompt
-        from agent.tasks import result_looks_ok
-        self.assertTrue(result_looks_ok('{"city": "成都", "weather": "阴"}'))
-        self.assertFalse(result_looks_ok('[exitCode:0]\n[FAIL]'))
-        self.assertFalse(result_looks_ok('sh: check: No such file or directory'))
-        payload = task_payload(self.desc)
-        memory = Memory()
-        first = decide_response(payload, memory)
-        self.assertIn('--data-urlencode', first['executeCmd'])
-        payload['roundNo'] = 2
-        payload['lastCmdResult'] = '[exitCode:0]\n{"city": "成都", "weather": "阴"}'
-        second = decide_response(payload, memory)
-        self.assertEqual(second['executeCmd'], '', '成功结果之后不应再探测')
-        self.assertIn('history', second['prompt'])
-
-    def test_flat_response_is_not_auto_submitted(self):
-        # 单对象响应没有可证明的答题字段 -> 交回 LLM 组织答案, 不硬猜格式
-        harvest = '__API {"status": "OK", "records": [], "flat": {"city": "成都", "weather": "阴"}}'
-        self.assertIsNone(templates.derive_answer(self.desc, '', harvest))
-
-    def test_documented_param_is_tried_first_by_harvest(self):
-        desc = ('【自进化任务】查询北京市全部文化遗产记录。\n'
-                '接口示例：GET http://localhost:8899/api/v1/heritage/search?location=北京&limit=100\n'
-                '提交 `city`、`total_count`。')
-        command = templates.api_command(desc, '')
-        self.assertIsNotNone(command)
-        self.assertIn("PARAMS='location", command)
-
-
-class DeadlineTests(unittest.TestCase):
-    def offer(self, timeout):
-        """任务尚未接单(phaseTask 为空), 只有任务点报价。"""
-        desc = ENGINEER_DESC % '/tmp/selfEvolutionTask/x/ws_9/'
-        payload = task_payload(desc)
-        payload['phaseTask'] = ''
-        payload['teamOur']['playerTasks'][0]['timeoutRounds'] = timeout
-        return payload
-
-    def test_task_with_too_little_time_is_not_accepted(self):
-        memory = Memory()
-        response = decide_response(self.offer(2), memory)      # 只剩 2 回合
+        response = decide_response(p, memory)
         self.assertNotIn('acceptTask', [c['action'] for c in response['roleCommandMap'].values()])
-        self.assertTrue(any('offer skipped' in line for line in memory.trace), memory.trace)
+        self.assertTrue(any('TASK_OFFER_SKIP' in line for line in memory.trace), memory.trace)
 
-    def test_task_with_enough_time_is_accepted(self):
-        response = decide_response(self.offer(60), Memory())
+    def test_offer_with_enough_time_is_accepted(self):
+        p = task_fixture()
+        p['phaseTask'] = ''
+        p['teamOur']['playerTasks'][0]['timeoutRounds'] = 60
+        memory = Memory()
+        response = decide_response(p, memory)
         self.assertEqual(response['roleCommandMap']['4']['action'], 'acceptTask')
 
+    def test_documented_single_call_is_issued_once_with_urlencoded_value(self):
+        desc = ('【自进化任务】请查询成都今天的天气并提交答案。\n'
+                '第三方天气API文档：GET http://127.0.0.1:9/weather?city=<城市名>\n'
+                '返回 JSON：{"city": "...", "weather": "..."}')
+        family, command = templates.plan(desc, '')
+        self.assertEqual(family, 'doc_query')
+        self.assertTrue(command.startswith('curl -s -G "'))
+        self.assertIn('--data-urlencode "city=成都"', command)
+        self.assertEqual(templates.estimate_task_rounds(desc, ''), 2)
 
-class ParkingCellTests(unittest.TestCase):
-    """需求1: 任何人不得站在"待建围墙格"上(会在那一圈占位, 导致围墙建不起来)。"""
+    def test_city_placeholder_is_not_mistaken_for_the_task_city(self):
+        text = '第三方天气API文档：GET http://x/weather?city=<城市名>'
+        self.assertEqual(templates.city_name(text), '')
+        self.assertEqual(templates.city_name('请查询南京今天的天气。' + text), '南京')
 
-    def day_payload(self, walls=()):
-        sites = wall_sites(Turn.load(payload()))
-        p = payload(day=2, gold=200, walls=list(walls))
-        return p, sites
-
-    def test_unbuilt_wall_cells_are_excluded_from_pathing(self):
-        p, sites = payload_and_sites(self.day_payload()[0])
-        m = Memory(day=2)
-        planner = Planner(Turn.load(p), p, m)
-        parking = planner.parking_cells()
-        self.assertTrue(set(sites) <= parking,
-                        sorted(parking, key=lambda q: (q.x, q.y)))
-        worker = planner.turn.workers()[0]
-        routes = planner.route(worker)
-        for site in sites:
-            self.assertNotIn(site, routes.cost, '待建围墙格不应出现在可达格集合里')
-
-    def test_built_wall_cells_are_not_parking_cells(self):
-        p, sites = self.day_payload()
-        p['teamOur']['roles'].append(unit(40, 'wall', sites[0].x, sites[0].y, health=1000))
-        m = Memory(day=2)
-        planner = Planner(Turn.load(p), p, m)
-        self.assertNotIn(sites[0], planner.parking_cells())
-        self.assertIn(sites[1], planner.parking_cells())
-
-    def test_nobody_ever_moves_onto_a_pending_wall_cell(self):
-        # 把工人摆在待建围墙格上(最坏情况), 一轮之内它必须离开这一圈
-        p, sites = self.day_payload()
-        p['teamOur']['roles'][1]['pos'] = sites[2].dump()
-        m = Memory(day=2)
-        planner = Planner(Turn.load(p), p, m)
-        planner.run()
-        parking = planner.parking_cells()
-        for uid, command in planner.commands.items():
-            if command['action'] != 'move':
-                continue
-            target = Pos.load(command['targetPos'][0])
-            self.assertNotIn(target, parking, f'role {uid} 停在待建围墙格 {target}')
-
-    def test_tower_operators_do_not_stand_in_the_wall_ring(self):
-        p, sites = self.day_payload()
-        m = Memory(day=2)
-        planner = Planner(Turn.load(p), p, m)
-        parking = planner.parking_cells()
-        for role, tower in planner.assign_towers(day=True) or []:
-            self.assertNotIn(role.pos, parking)
-
-
-class ShopStandbyTests(unittest.TestCase):
-    """需求2: 开拓者没任务时去商店旁待命并按计划买券。"""
-
-    def pioneer_payload(self, day=1, gold=250, pos=None):
-        p = payload(day=day, gold=gold)
-        p['teamOur']['roles'].append(unit(4, 'pioneer', *(pos or (14, 20))))
-        p['teamOur']['playerTasks'] = []
-        p['phaseTask'] = ''
-        return p
-
-    def test_walks_toward_shop_when_idle(self):
-        p = self.pioneer_payload()
-        m = Memory(day=1)
-        planner = Planner(Turn.load(p), p, m)
-        pioneer = next(r for r in planner.turn.alive(('pioneer',)))
-        shop = next(q for q, k in planner.turn.zones.items() if k == 'weaponShop')
-        self.assertTrue(planner.pioneer_standby())
-        command = planner.commands['4']
-        self.assertEqual(command['action'], 'move')
-        target = Pos.load(command['targetPos'][0])
-        self.assertLess(distance(target, shop), distance(pioneer.pos, shop))
-
-    def test_buys_plan_items_once_standing_at_the_shop(self):
-        p = self.pioneer_payload(pos=(7, 25))          # 商店(7,24)旁边
-        m = Memory(day=1)
-        planner = Planner(Turn.load(p), p, m)
-        self.assertTrue(planner.pioneer_standby())
-        command = planner.commands['4']
-        self.assertEqual(command['action'], 'buy', command)
-        self.assertIn(command['name'], ('WeaponUpgradeVoucher1', 'WeaponUpgradeVoucher2'))
-
-    def test_no_standby_shopping_while_a_task_is_active(self):
-        desc = ENGINEER_DESC % '/tmp/selfEvolutionTask/x/ws_1/'
-        p = task_payload(desc)
-        p['teamOur']['roles'].append(unit(4, 'pioneer', 12, 25))
-        m = Memory(day=1)
-        planner = Planner(Turn.load(p), p, m)
-        Tasks(planner).sync_task()
-        self.assertIsNotNone(m.task)
-        self.assertFalse(planner.pioneer_standby())
-
-    def test_returns_home_before_dark_instead_of_shopping(self):
-        # 第 70 回合起只剩 6 回合: 开拓者必须一路回家, 不再去商店下单
-        p = self.pioneer_payload(pos=(14, 20))
-        m = Memory(day=1)
-        for n in range(70, 78):
-            p['roundNo'] = n
-            response = decide_response(p, m)
-            command = response['roleCommandMap'].get('4')
-            self.assertNotEqual((command or {}).get('action'), 'buy',
-                                '天黑前不该再去商店买东西')
-            roles = {str(u['id']): u for u in p['teamOur']['roles']}
-            if command and command['action'] == 'move':
-                roles['4']['pos'] = command['targetPos'][0]
-            pos = Pos.load(roles['4']['pos'])
-            towers = [Pos.load(u['pos']) for u in p['teamOur']['roles']
-                      if u['roleType'] in ('rocket', 'railgun', 'gatling')]
-            if min(distance(pos, t) for t in towers) <= 1:
-                return                      # 天黑前已回到武器塔旁
-        self.fail('开拓者未在天黑前回到武器塔旁')
-
-    def test_no_shopping_at_night(self):
-        p = self.pioneer_payload(pos=(7, 25))
-        p['roundNo'] = 85
-        m = Memory(day=1)
-        planner = Planner(Turn.load(p), p, m)
-        self.assertFalse(planner.economic.shop_standby(
-            next(r for r in planner.turn.alive(('pioneer',))), planner.route(
-                next(r for r in planner.turn.alive(('pioneer',))))))
-
-
-class StationUrgentPurchaseTests(unittest.TestCase):
-    """需求3: 第3天之后基地受伤 -> 当天第一优先级去买基地升级券。"""
-
-    def test_prepare_assigns_station_voucher_purchase_on_day3(self):
-        p = payload(day=3, gold=400, station_health=900)
-        m = Memory(day=3)
-        planner = Planner(Turn.load(p), p, m)
-        planner.economic.prepare()
-        jobs = [j for j in m.jobs.values() if j.get('item', '').startswith('Station')]
-        self.assertTrue(jobs, m.jobs)
-        self.assertEqual(jobs[0]['item'], 'StationUpgradeVoucher1')
-
-    def test_no_station_purchase_before_day3(self):
-        p = payload(day=2, gold=400, station_health=900)
-        m = Memory(day=2)
-        planner = Planner(Turn.load(p), p, m)
-        planner.economic.prepare()
-        jobs = [j for j in m.jobs.values() if j.get('item', '').startswith('Station')]
-        self.assertFalse(jobs, m.jobs)
-
-    def test_damage_flag_latches_from_observation(self):
-        p = payload(day=3, gold=200, station_health=900)
-        m = Memory()
-        decide_response(p, m)
-        self.assertTrue(m.station_hit)
-        self.assertEqual(m.day_start_gold, 200)
-
-    def test_station_voucher_used_at_night_next_to_base(self):
-        p = payload(day=3, gold=0, station_health=900)
-        p['roundNo'] = (3 - 1) * 130 + 75            # 夜晚
-        p['teamOur']['roles'][1]['pos'] = {'x': 9, 'y': 24}    # 基地旁
-        p['teamOur']['roles'][1]['backpack'] = ['StationUpgradeVoucher1']
-        m = Memory(day=3)
-        planner = Planner(Turn.load(p), p, m)
-        planner.run()
-        command = planner.commands.get('2')
-        self.assertIsNotNone(command, planner.commands)
-        self.assertEqual(command['action'], 'use')
-        self.assertEqual(command['name'], 'StationUpgradeVoucher1')
-
-
-# ---------------------------------------------------------------- 公共夹具
-def payload(day=1, gold=75, walls=None, zones=None, station_health=1500):
-    p = fixture()
-    p['roundNo'] = (day - 1) * 130 + 1
-    p['teamOur']['goldNum'] = gold
-    p['teamOur']['roles'] = [
-        unit(1, 'station', 10, 24, health=station_health),
-        unit(2, 'worker', 9, 24), unit(3, 'worker', 12, 24),
-        unit(10, 'rocket', 9, 23), unit(11, 'rocket', 10, 23), unit(12, 'railgun', 11, 25),
-    ] + list(walls or [])
-    p['mapInfo']['zones'] = zones if zones is not None else [
-        {'pos': {'x': 6, 'y': 24}, 'neutralType': 'stone'},
-        {'pos': {'x': 6, 'y': 22}, 'neutralType': 'copper'},
-        {'pos': {'x': 5, 'y': 24}, 'neutralType': 'vendor'},
-        {'pos': {'x': 7, 'y': 24}, 'neutralType': 'weaponShop'},
-    ]
-    p['weaponShopList'] = [{'name': n, 'price': v} for n, v in [
-        ('WeaponUpgradeVoucher1', 100), ('WeaponUpgradeVoucher2', 150),
-        ('WallUpgradeVoucher1', 20), ('WallUpgradeVoucher2', 30),
-        ('StationUpgradeVoucher1', 100), ('StationUpgradeVoucher2', 150),
-        ('WallFixer', 10)]]
-    return p
-
-
-def payload_and_sites(p):
-    return p, wall_sites(Turn.load(p))
-
-
-def task_payload(desc):
-    p = fixture()
-    p['teamOur']['roles'] = [p['teamOur']['roles'][0], unit(4, 'pioneer', 12, 25)]
-    p['mapInfo']['zones'] = [{'pos': {'x': 13, 'y': 26}, 'neutralType': 'challengerTaskPoint1'}]
-    p['teamOur']['playerTasks'] = [{'taskPosition': {'x': 13, 'y': 26}, 'isValid': True,
-                                    'coldDownRounds': 0, 'timeoutRounds': 60,
-                                    'scoreReward': 50, 'goldReward': 30,
-                                    'taskType': '自进化类1'}]
-    p['phaseTask'] = desc
-    return p
+    def test_unknown_instructions_have_no_deterministic_plan(self):
+        desc = '【自进化任务】请阅读 task_9.md 并按里面的说明完成任务'
+        self.assertIsNone(templates.plan(desc, ''))
 
 
 if __name__ == '__main__':

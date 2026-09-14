@@ -13,8 +13,7 @@ from .economy import Economy
 from .tasks import Tasks
 from .protocol import (Pos, Turn, build_command, distance, move_command,
                        station_footprint)
-from .economy import (DAY1_ORE_PHASE_ROUNDS, DAY_ROUNDS, NIGHT_PREPOSITION_ROUND,
-                          WALL_MAINTENANCE_DAY)
+from .economy import (DAY1_ORE_PHASE_ROUNDS, DAY_ROUNDS, WALL_MAINTENANCE_DAY)
 from .fire_control import plan_fire, select_targets, shot_damage, threat, on_segment
 
 LOADOUT = ("rocket", "rocket", "rocket")   # 要求: 75 金币开局买三座火箭炮
@@ -22,6 +21,8 @@ RETURN_MARGIN = 2          # 回到武器旁的少量安全余量
 INNER_STAND_SLACK = 8      # 夜间交互站位: 为走到"靠基地内侧"最多多走的步数
 RETURN_DEADLINE = 75       # 当天第75回合(含入夜前5回合)前必须回到武器塔旁; 夜间允许移动
 PREPOSITION_SAFE_RADIUS = 8   # 夜间预置站位: 目的地该半径内还有机器人就不去
+THREAT_RADIUS = 10            # 夜战结束判定: 基地/炮位该半径内还有活机器人就继续防守
+                              #   (与火箭炮 1 级射程 10 对齐; 不再用固定夜末回合数等待)
 
 
 def ring(turn, radius):
@@ -513,22 +514,23 @@ class Planner:
 
     @staticmethod
     def _battle_over(turn):
-        """夜战是否已结束(机器人清空, 或已到夜末且阵前无威胁)。
+        """夜战是否已结束: 只要阵前(基地/炮位 THREAT_RADIUS 格内)没有活着的机器人就算结束。
 
-        威胁半径以武器塔为锚点; 还没有武器塔时以基地占地为锚点(否则无从判断)。
+        用"威胁半径"而不是"夜末固定回合"判断 —— 之前写成"等不到某个回合就不动",
+        实战里机器人清空后人物还会干等到夜里第 50 多回合才动(需求: 一清场就行动)。
+        威胁半径以武器塔为锚点; 还没有武器塔时以基地占地为锚点。
+        远处(半径外)仍在游走的机器人不算威胁: 它们一旦靠近, 下一回合判定就会翻回
+        "战斗中", 已经离岗的角色会被炮位分配召回(见 night() 的 else 分支)。
         """
-        rod = (turn.round_no-1) % 130 + 1
         anchors = [t.pos for t in turn.weapons()]
         if not anchors:
             station = turn.station()
             anchors = list(station_footprint(station.pos)) if station is not None else []
-        living = [r for r in turn.robots if r.health > 0]
-        if any(anchors and min(distance(r.pos, p) for p in anchors) <= PREPOSITION_SAFE_RADIUS
-               for r in living):
-            return False                     # 阵前还有敌人 -> 留在炮位
-        if not living:
+        if not anchors:
             return True
-        return rod >= NIGHT_PREPOSITION_ROUND
+        return not any(r.health > 0
+                       and min(distance(r.pos, p) for p in anchors) <= THREAT_RADIUS
+                       for r in turn.robots)
 
     def night_battle_over(self):
         return self.battle_over
