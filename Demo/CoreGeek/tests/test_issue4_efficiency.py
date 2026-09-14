@@ -243,12 +243,14 @@ class NightVoucherDeliveryTests(unittest.TestCase):
                    key=lambda q: distance(q, station))
 
     def test_night_uses_voucher_when_already_on_inner_side(self):
-        # 已站在靠基地内侧 -> 夜里直接使用券
+        # 已在炮位、贴墙且没有攻击目标 -> 原地使用券
         sites = wall_sites(Turn.load(payload()))
         p = payload(day=1, gold=0, walls=[unit(40, 'wall', sites[0].x, sites[0].y, health=1000)])
         p['roundNo'] = 85
         p['teamOur']['roles'][1]['pos'] = self.inner_cell(sites[0]).dump()
         p['teamOur']['roles'][1]['backpack'] = ['WallUpgradeVoucher1']
+        stand = self.inner_cell(sites[0])
+        next(u for u in p['teamOur']['roles'] if u['id']==10)['pos'] = {'x':stand.x,'y':stand.y-1}
         m = Memory(day=1)
         planner = Planner(Turn.load(p), p, m)
         planner.run()
@@ -277,8 +279,8 @@ class NightVoucherDeliveryTests(unittest.TestCase):
         tgt = Pos.load(cmd['targetPos'][0])
         self.assertLess(distance(tgt, station), distance(outside, station), '应走向更靠基地的一侧')
 
-    def test_night_moves_toward_target_when_carrying_voucher(self):
-        # 拿着券但不在墙边 -> 夜里也要朝墙走过去用掉(而不是直接去武器位)
+    def test_night_returns_to_tower_instead_of_delivering_wall_voucher(self):
+        # 夜间先保证炮位，不为墙券离开防御位置。
         sites = wall_sites(Turn.load(payload()))
         p = payload(day=1, gold=0, walls=[unit(40, 'wall', sites[0].x, sites[0].y, health=1000)])
         p['roundNo'] = 85
@@ -290,9 +292,10 @@ class NightVoucherDeliveryTests(unittest.TestCase):
         cmd = planner.commands.get('2')
         self.assertIsNotNone(cmd, planner.commands)
         self.assertEqual(cmd['action'], 'move', cmd)
-        # 目标应是朝该墙方向的格子(比当前位置更靠近墙)
+        # 朝已分配的炮位移动，而不是配送围墙券。
         tgt = Pos.load(cmd['targetPos'][0])
-        self.assertLess(distance(tgt, sites[0]), distance(Pos(9, 21), sites[0]))
+        tower = next(t for t in planner.turn.weapons() if t.unit_id==m.tower_assignments[2])
+        self.assertLess(distance(tgt, tower.pos), distance(Pos(9, 21), tower.pos))
 
     def test_night_weapon_voucher_also_delivered(self):
         p = payload(day=1, gold=0)
