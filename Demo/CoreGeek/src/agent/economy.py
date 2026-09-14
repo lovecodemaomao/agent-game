@@ -141,22 +141,83 @@ class Economy:
         if job['item']=='WallFixer': return target.health<HP['wall'][max(1,target.level)-1]
         return target.level==job['level']
 
+    def held_options(self, role):
+        """Inventory use is independent of the shop's preferred repair option."""
+        result=[]
+        for target in self.turn.ours:
+            if target.health<=0 or target.kind not in HP: continue
+            level=max(1,min(3,target.level))
+            prefix=('Station' if target.kind=='station' else
+                    'Wall' if target.kind=='wall' else 'Weapon')
+            voucher=f'{prefix}UpgradeVoucher{level}'
+            if level<3 and voucher in role.backpack:
+                result.append((0,level,target.unit_id,voucher,target))
+            if (target.kind=='wall' and 'WallFixer' in role.backpack
+                    and target in self.damaged_walls()):
+                result.append((1,level,target.unit_id,'WallFixer',target))
+        return result
+
+    def use_consumable(self, role):
+        if 'Medicine' in role.backpack and role.health < 100:
+            self.p.commands[str(role.unit_id)]={'action':'use','name':'Medicine'}
+            return True
+        if SUMMON_ORDER in role.backpack:
+            self.p.commands[str(role.unit_id)]={'action':'use','name':SUMMON_ORDER}
+            if self.m.jobs.get(role.unit_id,{}).get('item') == SUMMON_ORDER:
+                self.m.jobs.pop(role.unit_id,None)
+            self.m.summon_order_done=True
+            return True
+        return False
+
+    def defer_delivery(self, role, job):
+        self.m.blocked_deliveries[(role.unit_id,job['unit'])]=self.turn.round_no+8
+        self.m.jobs.pop(role.unit_id,None)
+
+    def purchase_count(self, role, item, price, requested, assigned=()):
+        """Bound a batch by stock, matching targets, capacity and current funds."""
+        capacity=(role.capacity if role.capacity is not None else 100)-len(role.backpack)
+        limit=min(requested,max(0,capacity),int(self.p.gold//price)) if price>0 else 0
+        if 'UpgradeVoucher' in item:
+            prefix,level=item.split('UpgradeVoucher')
+            kinds={'Weapon':('rocket','railgun','gatling'),'Wall':('wall',),'Station':('station',)}
+            targets=sum(u.health>0 and u.kind in kinds.get(prefix,()) and u.level==int(level)
+                        and u.unit_id not in assigned for u in self.turn.ours)
+            held=sum(r.backpack.count(item) for r in self.turn.controllable())
+            limit=min(limit,max(0,targets-held))
+        return max(0,limit)
+
     def prepare(self):
-        for role in self.turn.workers():
+        for role in self.turn.controllable():
             job=self.m.jobs.get(role.unit_id)
             if job and job.get('type')=='upgrade':
                 if not self.usable(job,self.target(job)):
                     self.m.jobs.pop(role.unit_id,None)
                 else:
                     job['bought']=job['item'] in role.backpack
+                    if self.p.route(role).distance(self.target(job).pos)>=INF:
+                        self.defer_delivery(role,job)
+                        continue
                     if not job['bought'] and (not self.turn.is_day or self.p.remaining<8):
+                        self.m.jobs.pop(role.unit_id,None)
+                    elif not job['bought'] and any(
+                            self.p.route(role).distance(o[4].pos)<INF and
+                            self.m.blocked_deliveries.get((role.unit_id,o[2]),0)<=self.turn.round_no
+                            for o in self.held_options(role)):
                         self.m.jobs.pop(role.unit_id,None)
         occupied={j['unit'] for j in self.m.jobs.values() if j.get('type')=='upgrade'}
         # Recover vouchers already held, including after a worker was revived.
-        for role in self.turn.workers():
+        # Bind vouchers before repair packs, so an upgrade can restore health
+        # without consuming a second role's repair stock on the same building.
+        for role in sorted(self.turn.controllable(),key=lambda r:
+                           not any('UpgradeVoucher' in item for item in r.backpack)):
+            if role.unit_id in self.p.engaged: continue
             if self.m.jobs.get(role.unit_id,{}).get('type')=='upgrade': continue
-            for _,level,uid,item,target in self.options():
-                if uid not in occupied and item in role.backpack:
+            routes=self.p.route(role)
+            candidates=sorted(self.held_options(role),key=lambda o:
+                              (o[0],routes.distance(o[4].pos),o[2]))
+            for _,level,uid,item,target in candidates:
+                if (uid not in occupied and routes.distance(target.pos)<INF
+                        and self.m.blocked_deliveries.get((role.unit_id,uid),0)<=self.turn.round_no):
                     self.m.jobs[role.unit_id]={'type':'upgrade','unit':uid,'item':item,
                         'level':level,'bought':True,'price':0}
                     occupied.add(uid)
@@ -215,6 +276,9 @@ class Economy:
             choices=[]
             for role in self.turn.workers():
                 if role.backpack_full: continue
+                if self.m.blocked_deliveries.get((role.unit_id,uid),0)>self.turn.round_no: continue
+                count=self.purchase_count(role,item,price,buy_n,occupied)
+                if count<1: continue
                 routes=self.p.route(role)
                 for shop in shops:
                     stand=routes.adjacent(shop)
@@ -223,9 +287,9 @@ class Economy:
                     return_cost=max((self.p.home_cost(role,s) for s in self.p.geo.seats(target.pos)),default=INF)
                     cost=routes.cost[stand]+delivery+return_cost+2+5
                     if cost<self.p.remaining:
-                        choices.append((cost,role,shop))
+                        choices.append((cost,role,shop,count))
             if choices:
-                _,role,shop=min(choices,key=lambda x:x[0])
+                _,role,shop,buy_n=min(choices,key=lambda x:x[0])
                 # 批量采购: 同一种券一次买够(受当天配额与金币限制, 见上方 need/buy_n)
                 self.m.jobs[role.unit_id]={'type':'upgrade','unit':uid,'item':item,
                     'level':level,'bought':False,'price':price,'shop':shop,'num':buy_n}
@@ -294,6 +358,10 @@ class Economy:
             self.m.jobs.pop(role.unit_id,None)
             return False
         num=max(1,int(job.get('num',1)))
+        num=self.purchase_count(role,item,job['price'],num)
+        if num<1:
+            self.m.jobs.pop(role.unit_id,None)
+            return False
         if self.p.interact(role,routes,shop,'buy',name=item,num=num):
             if routes.distance(shop)==0: self.p.gold-=job['price']*num
             return True
@@ -404,15 +472,12 @@ class Economy:
             return False
         if job['item'] in role.backpack:
             if routes.distance(target.pos)==0:
-                self.p.interact(role,routes,target.pos,'use',name=job['item'],targetPos=[target.pos.dump()])
+                acted=self.p.interact(role,routes,target.pos,'use',name=job['item'],targetPos=[target.pos.dump()])
                 self.m.event(f'worker {role.unit_id}: use {job["item"]} on {target.unit_id}')
-                # 记录当天配额进度
-                if job['item'].startswith('Wall'): self.m.day_wall_upgrades += 1
-                elif job['item'].startswith('Weapon'): self.m.day_weapon_upgrades += 1
-                return True
+                return acted
             if routes.distance(target.pos)>=INF:
                 # 目标不可达(被围死等): 放弃本次差事, 免得整夜绕路
-                self.m.jobs.pop(role.unit_id,None)
+                self.defer_delivery(role,job)
                 return False
             if self.turn.is_day:
                 if self.p.enough_time(role,routes,target.pos):
@@ -421,10 +486,10 @@ class Economy:
                 return False
             # 夜间: 必须先把手上的券用掉再去武器位（不允许揣着券过夜防御）。
             # 走到目标旁即用, 用完下回合由 assign_towers 送回武器旁。
-            self.p.interact(role,routes,target.pos,'use',
+            acted=self.p.interact(role,routes,target.pos,'use',
                             name=job['item'],targetPos=[target.pos.dump()])
             self.m.event(f'worker {role.unit_id}: night delivery of {job["item"]}')
-            return True
+            return acted
         if not self.turn.is_day: return False
         if self.p.remaining<=self.p.home_cost(role,role.pos)+5:
             self.m.jobs.pop(role.unit_id,None)
@@ -434,6 +499,10 @@ class Economy:
             self.m.jobs.pop(role.unit_id,None)
             return False
         num=max(1,int(job.get('num',1)))
+        num=self.purchase_count(role,job['item'],job['price'],num)
+        if num<1:
+            self.m.jobs.pop(role.unit_id,None)
+            return False
         if self.p.interact(role,routes,shop,'buy',name=job['item'],num=num):
             if routes.distance(shop)==0: self.p.gold-=job['price']*num
             return True

@@ -75,6 +75,7 @@ class Planner:
         self.gold = turn.gold
         self.built = []
         self.build_targets = set()
+        self.planned_towers = set()
         self.prices = {x['name']: float(x['price']) for x in payload.get('vendorShopList', [])}
         self.shop_prices = {x['name']: int(x['price']) for x in payload.get('weaponShopList', [])}
         self.walls = wall_sites(turn)
@@ -93,13 +94,17 @@ class Planner:
     def move(self, role, routes, stand):
         if stand is None:
             return False
+        if self.memory.blocked_goals.get((role.unit_id, stand), 0) > self.turn.round_no:
+            return False
         if stand == role.pos:
             return True
         step = routes.first.get(stand)
-        if step is None:
+        if (step is None or step in self.reserved or step in self.build_targets
+                or step in self.turn.blocked(role) or not self.turn.land(step)):
             return False
         self.commands[str(role.unit_id)] = move_command(step)
         self.reserved.add(step)
+        self.memory.movement[role.unit_id] = stand
         return True
 
     def inner_stand(self, routes, target, action):
@@ -119,8 +124,8 @@ class Planner:
                  if q in routes.cost and distance(q, station.pos) < target_d]
         if not cands:
             return None
-        best = min(routes.cost[q] for q in cands)
-        near = [q for q in cands if routes.cost[q] <= best + INNER_STAND_SLACK]
+        nearest = routes.distance(target)
+        near = [q for q in cands if routes.cost[q] <= nearest + INNER_STAND_SLACK]
         if not near:
             return None
         return min(near, key=lambda q: (distance(q, station.pos), routes.cost[q], q.x, q.y))
@@ -138,12 +143,23 @@ class Planner:
                 stand = inner
         if stand is None:
             stand = routes.adjacent(target)
+        previous = self.memory.movement.get(role.unit_id)
+        if (stand is not None and stand != role.pos and previous in routes.cost and distance(previous, target) == 1
+                and routes.cost[previous] <= routes.cost[stand] + 2
+                and self.memory.blocked_goals.get((role.unit_id, previous), 0) <= self.turn.round_no
+                and (inner is None or distance(previous, station.pos) <= distance(stand, station.pos))):
+            stand = previous
+        if (stand is not None and
+                self.memory.blocked_goals.get((role.unit_id, stand), 0) > self.turn.round_no):
+            candidates = [q for q in neighbours(target) if q in routes.cost
+                          and self.memory.blocked_goals.get((role.unit_id, q), 0) <= self.turn.round_no]
+            stand = min(candidates, key=lambda q: (routes.cost[q], q.x, q.y), default=None)
         if stand is None:
             return False
         if stand == role.pos:
             self.commands[str(role.unit_id)] = {'action': action, **fields}
         else:
-            self.move(role, routes, stand)
+            return self.move(role, routes, stand)
         return True
 
     def home_cost(self, role, pos):
@@ -173,8 +189,23 @@ class Planner:
                 self.home_cost(role, stand) + RETURN_MARGIN < self.remaining)
 
     def run(self):
-        Tasks(self).run()
+        if self.payload.get('phaseTask'):
+            self.engaged.update(r.unit_id for r in self.turn.alive(('pioneer',)))
         self.economic.prepare()
+        # Existing inventory belongs to every role, including the pioneer.
+        # Active tasks retain their role; consumables never overwrite task commands.
+        for role in self.turn.controllable():
+            if role.unit_id in self.engaged or str(role.unit_id) in self.commands:
+                continue
+            if self.economic.use_consumable(role):
+                self.engaged.add(role.unit_id)
+            elif role.kind == 'pioneer' and self.economic.upgrade(role, self.route(role)):
+                self.engaged.add(role.unit_id)
+        # Only active tasks hold the pioneer unconditionally. Existing inventory
+        # gets a chance before accepting a new task or starting a treasure trip.
+        if self.payload.get('phaseTask'):
+            self.engaged.difference_update(r.unit_id for r in self.turn.alive(('pioneer',)))
+        Tasks(self).run()
         if not self.turn.is_day:
             self.night()
             return self.commands
@@ -182,6 +213,8 @@ class Planner:
         maintenance = next((r.unit_id for r in workers
                             if self.memory.jobs.get(r.unit_id,{}).get('type')!='upgrade'),None)
         for role in workers:
+            if role.unit_id in self.engaged:
+                continue
             routes = self.route(role)
             # Using a voucher in place takes one turn and must not be suppressed
             # by the generic five-turn return margin.
@@ -213,8 +246,11 @@ class Planner:
             return False
         blocked = self.turn.occupied_cells() | self.reserved | self.build_targets
         candidates = [p for p in ring(self.turn, 1) if p not in blocked]
-        candidates.sort(key=lambda p: (routes.distance(p), p.x, p.y))
+        previous = self.memory.construction_jobs.get(role.unit_id)
+        candidates.sort(key=lambda p: (previous != (kind, p), routes.distance(p), p.x, p.y))
         for target in candidates:
+            if not self.construction_accessible(target, tower=True):
+                continue
             if not self.enough_time(role, routes, target):
                 continue
             # Keep at least three distinct free operating cells for the final fleet.
@@ -225,12 +261,41 @@ class Planner:
                 continue
             if self.interact(role, routes, target, 'build', name=kind, targetPos=[target.dump()]):
                 self.build_targets.add(target)
+                self.planned_towers.add(target)
+                self.memory.construction_jobs[role.unit_id] = (kind, target)
                 if routes.distance(target) == 0:
                     self.gold -= 25
                     self.built.append(kind)
                     self.reserved.add(target)
                 return True
         return False
+
+    def construction_accessible(self, target, tower=False):
+        """Keep workers and distinct operating seats connected to the outside."""
+        from collections import deque
+        free = self.geo.free - self.build_targets
+        outside = set(ring(self.turn, 3)) & free
+        def reachable(cells):
+            seen = outside & cells
+            queue = deque(seen)
+            while queue:
+                for q in neighbours(queue.popleft()):
+                    if q in cells and q not in seen:
+                        seen.add(q)
+                        queue.append(q)
+            return seen
+        before = reachable(free)
+        after = reachable(free - {target})
+        if any(r.pos in before and r.pos not in after for r in self.turn.controllable()):
+            return False
+        fleet = [t.pos for t in self.turn.weapons()] + list(self.planned_towers)
+        if tower:
+            fleet.append(target)
+        seats = [set(neighbours(p)) & after for p in fleet]
+        def assign(index, used):
+            return index == len(seats) or any(assign(index+1, used | {q})
+                                             for q in seats[index] - used)
+        return assign(0, set())
 
     def missing_walls(self):
         occupied = self.turn.occupied_cells() | self.reserved | self.build_targets
@@ -271,10 +336,15 @@ class Planner:
             return False
         if not stock:
             return False        # 非采石工且手上无石头 -> 交给经济模块去采矿石
-        for target in sorted(missing, key=lambda p: (self.walls.index(p)//4, routes.distance(p))):
+        previous = self.memory.construction_jobs.get(role.unit_id)
+        for target in sorted(missing, key=lambda p: (previous != ('wall', p),
+                                                    self.walls.index(p)//4, routes.distance(p))):
+            if not self.construction_accessible(target):
+                continue
             if self.enough_time(role, routes, target) and self.interact(
                     role, routes, target, 'build', name='wall', targetPos=[target.dump()]):
                 self.build_targets.add(target)
+                self.memory.construction_jobs[role.unit_id] = ('wall', target)
                 if routes.distance(target) == 0:
                     self.reserved.add(target)
                 return True
@@ -302,6 +372,9 @@ class Planner:
         for chosen in combinations(roles, count):
             for fleet in permutations(towers, count):
                 cost = sum(paths[r.unit_id].distance(t.pos) for r, t in zip(chosen, fleet))
+                # Keep an existing post unless switching saves a meaningful trip.
+                cost += sum(3 for r, t in zip(chosen, fleet)
+                            if self.memory.tower_assignments.get(r.unit_id, t.unit_id) != t.unit_id)
                 # When undermanned, prefer rockets at equal walking cost.
                 cost += sum(t.kind != 'rocket' for t in fleet) * 0.1
                 if cost < best_cost:
@@ -309,10 +382,13 @@ class Planner:
         ready = []
         for role, tower in best:
             routes = self.route(role)
+            self.memory.tower_assignments[role.unit_id] = tower.unit_id
             if distance(role.pos, tower.pos) <= 1:
                 ready.append((role, tower))
             else:
-                self.move(role, routes, routes.adjacent(tower.pos))
+                seats = [q for q in neighbours(tower.pos) if q in routes.cost
+                         and self.memory.blocked_goals.get((role.unit_id, q), 0) <= self.turn.round_no]
+                self.move(role, routes, min(seats, key=lambda q: (routes.cost[q], q.x, q.y), default=None))
         return ready
 
     def night(self):
@@ -320,6 +396,8 @@ class Planner:
         # 立即修复（只做"已经在墙边"的即时修复，不为修墙长途走动而放弃操炮）。
         self.economic.prepare()
         for role in self.turn.workers():
+            if role.unit_id in self.engaged:
+                continue
             if self.economic.upgrade(role, self.route(role)):
                 self.engaged.add(role.unit_id)
         ready = self.assign_towers()

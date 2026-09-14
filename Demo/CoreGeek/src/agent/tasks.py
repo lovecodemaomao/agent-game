@@ -164,7 +164,7 @@ class Tasks:
         if self.pioneer:
             if self.m.task:
                 held = self.solve()
-            elif self.turn.is_day:
+            elif self.turn.is_day and self.pioneer.unit_id not in self.p.engaged:
                 held = self.treasure() or self.acquire()
             if held:
                 self.p.engaged.add(self.pioneer.unit_id)
