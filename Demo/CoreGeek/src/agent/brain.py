@@ -120,6 +120,7 @@ class Planner:
         self.day = self.memory.day or ((turn.round_no-1)//130+1)
         self.walls = wall_sites(turn, extend=1 if self.day >= WALL_MAINTENANCE_DAY else 0)
         self.home_cost_cache = {}
+        self.route_cache = {}
         # 可用回合预算到当天第 RETURN_DEADLINE 回合为止（含入夜 5 回合, 夜间可移动）
         self.remaining = max(0, RETURN_DEADLINE - (turn.round_no - 1) % 130)
         self.economic = Economy(self)
@@ -129,7 +130,14 @@ class Planner:
         failed = self.memory.failed_steps.get(role.unit_id)
         if failed and failed[1] >= self.turn.round_no:
             forbidden.add(failed[0])
-        return Routes(self.turn, role, forbidden)
+        # A Planner owns one immutable turn. Reservations and failed steps are
+        # the only changing route inputs; retain only the latest map per role.
+        key = (role.pos, frozenset(forbidden))
+        cached = self.route_cache.get(role.unit_id)
+        if cached is None or cached[0] != key:
+            cached = (key, Routes(self.turn, role, forbidden))
+            self.route_cache[role.unit_id] = cached
+        return cached[1]
 
     def parking_cells(self):
         """仍待建造的迎敌半圈围墙格 + 计划建造的炮位: 任何角色都不得停留其上。

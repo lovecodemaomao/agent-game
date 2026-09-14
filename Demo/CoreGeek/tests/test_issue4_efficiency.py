@@ -15,8 +15,7 @@ from test_strategy import fixture, unit
 from agent.brain import Planner, decide_response, wall_sites
 from agent.memory import Memory
 from agent.protocol import Turn, Pos, distance
-from agent.economy import (MIN_MINE_BATCH, STATION_FALLBACK_HP, STATION_FALLBACK_DAY,
-                           STATION_URGENT_DAY)
+from agent.economy import STATION_FALLBACK_HP, STATION_FALLBACK_DAY, STATION_URGENT_DAY
 from agent.tasks import Tasks
 
 
@@ -79,8 +78,8 @@ class BatchTests(unittest.TestCase):
         role = planner.turn.workers()[0]
         cands = planner.economic.mining_candidates(role, planner.route(role))
         self.assertTrue(cands)
-        self.assertGreaterEqual(max(c['left'] for c in cands), MIN_MINE_BATCH,
-                                '单趟采集量应不小于 MIN_MINE_BATCH')
+        self.assertGreaterEqual(max(c['left'] for c in cands), 8,
+                                '时间和背包充足时应允许大批量采集')
 
     def test_does_not_run_to_vendor_for_a_few_ores(self):
         # 只揣着 3 块矿且不在小贩旁 -> 不专程跑小贩（继续采）
