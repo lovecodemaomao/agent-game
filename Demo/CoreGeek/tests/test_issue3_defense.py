@@ -106,7 +106,7 @@ class WallRepairTests(unittest.TestCase):
         self.assertNotIn('WallFixer', items)
 
     def test_night_repairs_when_already_adjacent(self):
-        # 夜间: 已在墙边且持有修复包 -> 立即修复(该工人本回合不操炮)
+        # 夜间无可攻击目标，已经在炮位且贴墙时可以原地修复。
         sites = wall_sites(Turn.load(payload()))
         front = sites[0]
         p = payload(day=1, gold=0, walls=[
@@ -117,6 +117,7 @@ class WallRepairTests(unittest.TestCase):
         inner = min(((max(abs(front.x+dx-10), abs(front.y+dy-24)), (front.x+dx, front.y+dy))
                      for dx in (-1,0,1) for dy in (-1,0,1) if dx or dy))[1]
         p['teamOur']['roles'][1]['pos'] = {'x': inner[0], 'y': inner[1]}
+        next(u for u in p['teamOur']['roles'] if u['id']==10)['pos'] = {'x':inner[0], 'y':inner[1]-1}
         m = Memory(day=1)
         r = decide_response(p, m)
         cmd = r['roleCommandMap'].get('2')
