@@ -128,7 +128,8 @@ class Planner:
         # 设成"一个完整白天"(RETURN_DEADLINE) —— 与次日白天的预算一致, 这样夜间
         # 选定的矿点/行程到次日清晨不会被重新规划成另一条路线(否则来回摇摆)。
         # 夜战未结束则预算为 0: 只守不干活。
-        self.battle_over = self._battle_over(turn)
+        # 夜间是否处于"开工"状态: 用 memory 的状态锁(连续清空才开工), 不是逐回合瞬时判定
+        self.battle_over = (self.memory.night_mode == 'work')
         if turn.is_day:
             self.remaining = max(0, RETURN_DEADLINE - (turn.round_no - 1) % 130)
         elif self.battle_over:
@@ -474,26 +475,45 @@ class Planner:
 
     @staticmethod
     def _battle_over(turn):
-        """夜战是否已结束: 只要阵前(基地/炮位 THREAT_RADIUS 格内)没有活着的机器人就算结束。
-
-        用"威胁半径"而不是"夜末固定回合"判断 —— 之前写成"等不到某个回合就不动",
-        实战里机器人清空后人物还会干等到夜里第 50 多回合才动(需求: 一清场就行动)。
-        威胁半径以武器塔为锚点; 还没有武器塔时以基地占地为锚点。
-        远处(半径外)仍在游走的机器人不算威胁: 它们一旦靠近, 下一回合判定就会翻回
-        "战斗中", 已经离岗的角色会被炮位分配召回(见 night() 的 else 分支)。
-        """
-        anchors = [t.pos for t in turn.weapons()]
-        if not anchors:
-            station = turn.station()
-            anchors = list(station_footprint(station.pos)) if station is not None else []
-        if not anchors:
-            return True
-        return not any(r.health > 0
-                       and min(distance(r.pos, p) for p in anchors) <= THREAT_RADIUS
-                       for r in turn.robots)
+        """逐回合的瞬时判定: 阵前(威胁半径内)是否已经没有活机器人。"""
+        from .geography import battle_over
+        return battle_over(turn)
 
     def night_battle_over(self):
-        return self.battle_over
+        """当前这一回合阵前是否清空(瞬时判定, 仅用于调试/测试)。"""
+        return self._battle_over(self.turn)
+
+    def night_work_mode(self):
+        """夜间是否已经进入'开工'状态锁(连续阵前清空 N 回合后才为真)。"""
+        return self.memory.night_mode == 'work'
+
+    def return_home_when_idle(self):
+        """夜间兜底: 没活可干又不在炮位旁的角色, 送回武器塔旁。
+
+        没有这段时, 夜里出工后一旦"矿点被同伴占满 / 背包满 / 任务点没报价",
+        角色会带着"已占岗位"标记站在原地过夜(现象就是"人一直在外面不回来")。
+        """
+        towers = list(self.turn.weapons())
+        if not towers:
+            return
+        for role in self.turn.controllable():
+            if str(role.unit_id) in self.commands or role.unit_id in self.engaged:
+                continue
+            if any(distance(role.pos, tower.pos) <= 1 for tower in towers):
+                continue                      # 已经在炮位旁
+            routes = self.route(role)
+            seats = []
+            for tower in towers:
+                seats.extend(q for q in neighbours(tower.pos)
+                             if q in routes.cost
+                             and self.memory.blocked_goals.get((role.unit_id, q), 0)
+                             <= self.turn.round_no)
+            if not seats:
+                continue
+            stand = min(seats, key=lambda q: (routes.cost.get(q, 10**6), q.x, q.y))
+            if self.move(role, routes, stand):
+                self.memory.prepositioned.discard(role.unit_id)   # 交回炮位分配口径
+                self.memory.event(f'role {role.unit_id}: night idle -> back to tower')
 
     def post_target(self, role, routes):
         """下一天的岗位: 开拓者 -> 任务点旁; 工人 -> 次日矿点的采集邻格。"""
@@ -518,8 +538,8 @@ class Planner:
         """需求4: 夜战结束后先去占下一天的岗位 —— 工人到次日矿点旁, 开拓者到任务点旁。"""
         if role.unit_id in self.memory.prepositioned:
             return True                      # 已经在去岗位的路上, 不再被炮位分配拉回
-        if not self.night_battle_over():
-            return False
+        if not self.night_work_mode():
+            return False                     # 只有进入"开工"状态锁才出工(连续清空才切)
         station = self.turn.station()
         if station is None:
             return False
@@ -575,6 +595,10 @@ class Planner:
         # Defense owns all available operators at night. No delivery trip may
         # remove a controller; cooldown/idle turns may use items in place only.
         self.economic.prepare()
+        if not self.night_work_mode():
+            # 处于防守模式(含状态锁刚切回的那一回合): 先解除"已占下一天岗位",
+            # 这样下面的炮位分配本回合就能把出去干活的人召回来, 不会出现无人下指令的空转
+            self.memory.prepositioned.clear()
         ready = self.assign_towers()
         plan, _ = plan_fire(self.turn, [tower for _,tower in ready])
         serviced = set()
@@ -620,5 +644,7 @@ class Planner:
                     # 已开工的角色按"已占下一天岗位"记账, 否则下一回合会被
                     # 炮位分配拉回基地, 与去矿点的行程来回摇摆
                     self.memory.prepositioned.add(role.unit_id)
-        else:
-            self.memory.prepositioned.clear()   # 战斗重新开始 -> 交回炮位分配
+        # 兜底: 这一回合没拿到任何指令的人(矿点被同伴占满/背包满/任务点无报价等)
+        # 不能在外面干等一整夜 —— 把离塔的人送回武器塔旁
+        self.return_home_when_idle()
+        # (防守模式下的解除已在本回合开头完成, 这里不再重复)

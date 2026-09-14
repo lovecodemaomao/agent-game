@@ -89,6 +89,16 @@ class Tasks:
             self.accept_news(value)
             self.m.analysed_news = pending['token']
 
+    def own_task_cells(self):
+        """己方所有任务点格 —— 报价里查不到具体位置时的兜底交互范围。
+
+        没有这个兜底时, "有 phaseTask 但 playerTasks 里查不到该点"的任务会以空
+        positions 建档, 随后 solve 里 min([]) 抛 ValueError, 该回合所有角色的指令全部
+        丢失(服务器兜底返回空指令, 表现为所有人原地不动、在外面的也不回来)。
+        """
+        prefix=self.turn.team_type + 'TaskPoint'
+        return [p for p,k in self.turn.zones.items() if k.startswith(prefix)]
+
     def points(self):
         result = []
         prefix = self.turn.team_type + 'TaskPoint'
@@ -134,8 +144,9 @@ class Tasks:
                 distance(self.pioneer.pos,q) for q in x['positions']),default={})
             start = choice.get('accepted_round',self.turn.round_no-1)
             token = hashlib.sha256((desc+str(start)).encode()).hexdigest()[:12]
+            positions=choice.get('positions') or self.own_task_cells()
             self.m.task = {'desc':desc,'start':start,'timeout':int(choice.get('timeoutRounds') or 100),
-                           'token':token,'positions':choice.get('positions',[]),
+                           'token':token,'positions':positions,
                            'history':[],'proposal':None,'waiting_cmd':False,'skill':'',
                            'probes':0,'probe_results':[],'probing':False}
             # 同类任务快速通道: 题干结构一致(仅参数不同) -> 直接复用已验证的命令
@@ -235,8 +246,8 @@ class Tasks:
             # Do not issue executeCmd outside the known task interaction range;
             # 但任务仍有效就走回任务点(需求4: 开拓者去任务点做题),
             # 夜里战斗未结束时先守阵位。
-            if not self.can_work():
-                return False
+            if not self.can_work() or not task['positions']:
+                return False                      # 空 positions 时绝不 min([]) 抛异常
             routes = self.p.route(role)
             target = min(task['positions'],key=routes.distance)
             return self.p.move(role,routes,routes.adjacent(target))

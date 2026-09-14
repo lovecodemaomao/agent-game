@@ -202,16 +202,19 @@ class UpgradeOrderTests(unittest.TestCase):
         wall_pos = next(i for i, o in enumerate(options) if o[3].startswith('Wall'))
         self.assertLess(weapon_pos, wall_pos)
 
-    def test_day2_wall_vouchers_outrank_weapons(self):
-        # 用户要求: 优先去购买围墙升级卷(第2天起当天有围墙升级配额, 墙券先行)
-        planner, options = self.planned(day=2)
-        self.assertTrue([o for o in options if o[3].startswith('Wall')], '存在待升级围墙')
-        weapon_pos = next(i for i, o in enumerate(options) if o[3].startswith('Weapon'))
-        wall_pos = next(i for i, o in enumerate(options) if o[3].startswith('Wall'))
-        self.assertLess(wall_pos, weapon_pos, [o[3] for o in options])
+    def test_weapons_still_outrank_walls_without_wall_pressure(self):
+        # 用户口径: 无论怎样都是优先升级武器; 只有前夜围墙承伤 > 80% 才把围墙券提前
+        for day in (2, 3):
+            planner, options = self.planned(day=day)
+            self.assertTrue([o for o in options if o[3].startswith('Wall')], '存在待升级围墙')
+            weapon_pos = next(i for i, o in enumerate(options) if o[3].startswith('Weapon'))
+            wall_pos = next(i for i, o in enumerate(options) if o[3].startswith('Wall'))
+            self.assertLess(weapon_pos, wall_pos, f'day{day} ' + str([o[3] for o in options]))
 
-    def test_day3_wall_vouchers_still_outrank_weapons(self):
+    def test_wall_vouchers_lead_only_when_last_night_took_heavy_damage(self):
         planner, options = self.planned(day=3)
+        planner.memory.wall_pressure_high = True          # 前夜围墙承伤超过阈值
+        options = planner.economic.options()
         wall_pos = next(i for i, o in enumerate(options) if o[3].startswith('Wall'))
         weapon_pos = next(i for i, o in enumerate(options) if o[3].startswith('Weapon'))
         self.assertLess(wall_pos, weapon_pos, [o[3] for o in options])

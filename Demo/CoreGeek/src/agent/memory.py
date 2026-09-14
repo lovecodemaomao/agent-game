@@ -1,8 +1,10 @@
 """Per-game memory. Nothing from the judge or LLM is executed in this process."""
 from dataclasses import dataclass, field
 
+NIGHT_MODE_CALM_ROUNDS = 2     # 连续 2 回合阵前清空 -> 夜间进入"开工"模式
+NIGHT_MODE_HOT_ROUNDS = 2      # 连续 2 回合阵前有敌 -> 夜间回到"防守"模式
 WALL_PRESSURE_DAY = 3          # 需求6: 第3天白天起开始计算围墙承伤
-WALL_PRESSURE_RATIO = 0.5      # 需求6: 昨夜围墙承伤超过该比例 -> 当天转向围墙升级券
+WALL_PRESSURE_RATIO = 0.8      # 用户口径: 前夜围墙承伤超过该比例 -> 当天降武器升级、升围墙券
 
 
 @dataclass
@@ -35,6 +37,9 @@ class Memory:
     station_hit: bool = False                          # 基地是否受过伤(需求3: 触发基地升级券)
     day_start_gold: int = 0                            # 当天开始时的金币(基地券档位判断)
     prepositioned: set = field(default_factory=set)    # 需求4: 夜间已去下一天岗位的角色
+    night_mode: str = 'defend'                         # 夜战状态锁: 'defend' / 'work'
+    night_hot: int = 0                                 # 连续"阵前有敌"回合数
+    night_calm: int = 0                                # 连续"阵前清空"回合数
     wall_hp: dict = field(default_factory=dict)        # 需求6: {uid: (health, max_hp)} 逐回合核对承伤
     night_wall_damage: float = 0.0                     # 需求6: 本夜围墙累计掉血
     night_wall_total: float = 0.0                      # 需求6: 本夜围墙累计最大血量(含被打掉的)
@@ -70,6 +75,9 @@ class Memory:
             self.day_weapon_upgrades = 0
             self.day_start_gold = turn.gold          # 需求3: "当天白天开始时的金币"
             self.prepositioned.clear()               # 需求4: 新的一天重新就位防守
+            self.night_mode = 'defend'               # 夜战状态锁回到"防守"
+            self.night_hot = 0
+            self.night_calm = 0
             # 需求6: 第3天起, 用"前一晚围墙承伤是否超过 50%"决定当天券的取向
             total = sum(self.night_wall_max.values())
             self.wall_pressure = (self.night_wall_damage/total) if total > 0 else 0.0
@@ -84,6 +92,20 @@ class Memory:
             self.night_wall_damage = 0.0
             self.night_wall_worst = 0.0
             self.night_wall_max = {}
+        # 需求4: 夜战状态锁 —— 用连续回合数去抖, 避免机器人贴着威胁半径来回时
+        # "出工/回塔"每回合翻转(实测会让工人在矿与塔之间来回踱步、既不采矿也不防守)
+        if not turn.is_day:
+            from .geography import battle_over
+            if battle_over(turn):
+                self.night_calm += 1
+                self.night_hot = 0
+            else:
+                self.night_hot += 1
+                self.night_calm = 0
+            if self.night_calm >= NIGHT_MODE_CALM_ROUNDS:
+                self.night_mode = 'work'
+            elif self.night_hot >= NIGHT_MODE_HOT_ROUNDS:
+                self.night_mode = 'defend'
         # 需求6: 累计夜间围墙承伤(掉血 + 被打掉时的剩余血量); 白天我方 remove/重建不计
         self._track_wall_damage(turn)
         # 基地受伤是永久状态: 只要掉过血就一直记着, 用来触发基地升级券

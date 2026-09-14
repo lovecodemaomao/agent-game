@@ -11,12 +11,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_strategy import fixture, unit
+from test_tasks_economy import task_fixture
 from agent.brain import Planner, decide_response, ring, wall_sites
 from agent.memory import Memory
 from agent.protocol import Pos, Turn, distance
 from agent.economy import HP, WALL_MAINTENANCE_DAY
 
 DAY = 130
+
+
+def task_payload(desc, root='/tmp/selfEvolutionTask/x/ws_1/'):
+    p = task_fixture()
+    p['phaseTask'] = desc
+    return p
 
 
 def shops(shops_list=None):
@@ -311,8 +318,9 @@ class ShopStandbyTests(unittest.TestCase):
 class NightPrepositionTests(unittest.TestCase):
     """需求4: 夜战结束后工人去次日矿点旁, 开拓者去任务点旁。"""
 
-    def night_payload(self, robots=(), tasks=False, rod=100, day=1, gold=0, roles=None):
-        p = build_payload(day=day, gold=gold, robots=robots, tasks=tasks, rod=rod, roles=roles)
+    def night_payload(self, robots=(), tasks=False, rod=100, day=1, gold=0, roles=None, zones=None):
+        p = build_payload(day=day, gold=gold, robots=robots, tasks=tasks, rod=rod,
+                          roles=roles, zones=zones)
         return p
 
     def test_worker_moves_toward_next_day_mine_when_battle_is_over(self):
@@ -326,6 +334,79 @@ class NightPrepositionTests(unittest.TestCase):
         self.assertEqual(min(distance(stand, mine) for mine in mines), 1,
                          '预置站位必须是矿点的采集邻格')
 
+    def test_robot_at_the_threat_radius_edge_does_not_cause_pacing(self):
+        """回归: 机器人在威胁半径边缘来回时, 工人不能一会儿出工一会儿回塔。
+
+        以前"夜战结束"是逐回合瞬时判定: 机器人 11 格(判清场) / 9 格(判交战)交替时,
+        工人每回合被 出工<->回塔 来回推翻, 在矿与塔之间踱步却采不到矿。
+        现在用连续回合去抖的状态锁: 单回合的翻转不改变当前模式。
+        """
+        p = self.night_payload(rod=100, robots=[robot(1, 24, 24)])   # 先处于清场
+        m = Memory(day=3)
+        decide_response(p, m)
+        p['roundNo'] += 1
+        decide_response(p, m)
+        p['roundNo'] += 1
+        self.assertTrue(Planner(Turn.load(p), p, m).night_work_mode())
+        trail = []
+        for rb in (robot(1, 19, 24), robot(1, 24, 24), robot(1, 19, 24), robot(1, 24, 24)):
+            p['robot'] = {'roles': [rb]}
+            response = decide_response(p, m)
+            worker = next(r for r in p['teamOur']['roles'] if r['id'] == 2)
+            command = response['roleCommandMap'].get('2')
+            trail.append((worker['pos']['x'], worker['pos']['y']))
+            if command and command['action'] == 'move':
+                worker['pos'] = command['targetPos'][0]
+            p['roundNo'] += 1
+        mines = [Pos(6, 24), Pos(6, 22)]
+        spans = [min(distance(Pos(*q), mine) for mine in mines) for q in trail]
+        self.assertEqual(spans, sorted(spans, reverse=True),
+                         f'半径边缘的机器人不应带着工人折返, 实际轨迹 {trail}')
+
+    def test_idle_worker_returns_home_at_night_instead_of_staying_out(self):
+        """回归: 夜里进入开工状态但没活可干(无矿可采)时, 工人必须回武器塔旁。
+
+        此前这种人会带着"已占岗位"标记站在外面过夜(现象: 人一直在外面不回来)。
+        """
+        p = self.night_payload(rod=124, zones=[
+            {'pos': {'x': 5, 'y': 24}, 'neutralType': 'vendor'},
+            {'pos': {'x': 7, 'y': 24}, 'neutralType': 'weaponShop'},
+        ])
+        for role in p['teamOur']['roles']:
+            if role['id'] == 2:
+                role['pos'] = {'x': 6, 'y': 16}          # 远在外面, 附近没有任何矿
+        m = Memory(day=3)
+        decide_response(p, m)
+        p['roundNo'] += 1
+        response = decide_response(p, m)                 # 第 2 个清空回合 -> 开工状态
+        self.assertTrue(Planner(Turn.load(p), p, m).night_work_mode())
+        worker = next(r for r in p['teamOur']['roles'] if r['id'] == 2)
+        command = response['roleCommandMap'].get('2')
+        self.assertIsNotNone(command, '没活干也不能干等: 应当给出回塔的移动指令')
+        self.assertEqual(command['action'], 'move')
+        target = Pos.load(command['targetPos'][0])
+        towers = [t.pos for t in Turn.load(p).weapons()]
+        self.assertLess(min(distance(target, t) for t in towers),
+                        min(distance(Pos.load(worker['pos']), t) for t in towers),
+                        '应当朝武器塔移动')
+
+    def test_idle_pioneer_returns_home_at_night_when_no_task(self):
+        """回归: 夜里没有任务报价时, 开拓者不能停在任务点外面, 要回塔旁。"""
+        p = task_payload('【自进化任务】暂无任务')
+        p['teamOur']['playerTasks'] = []
+        p['roundNo'] = 124
+        for role in p['teamOur']['roles']:
+            if role['id'] == 4:
+                role['pos'] = {'x': 18, 'y': 16}         # 远在外面
+        m = Memory(day=1)
+        decide_response(p, m)
+        self.assertTrue(m.task['positions'], '报价里查不到位置时要用己方任务点格兜底(不能是空列表)')
+        p['roundNo'] += 1
+        response = decide_response(p, m)
+        command = response['roleCommandMap'].get('4')
+        self.assertIsNotNone(command, '没有任务时开拓者也应当回塔, 不能停在外面')
+        self.assertEqual(command['action'], 'move')
+
     def test_worker_stays_when_robots_are_still_attacking(self):
         p = self.night_payload(rod=100, robots=[robot(1, 9, 24)])
         m = Memory(day=1)
@@ -333,13 +414,20 @@ class NightPrepositionTests(unittest.TestCase):
         self.assertFalse(planner.night_battle_over())
 
     def test_distant_wandering_robot_does_not_block_night_actions(self):
-        # 阵前已清空(只剩远处游走的机器人) -> 立刻行动, 不再干等到夜末
+        # 阵前已清空(只剩远处游走的机器人) -> 连续清空 2 回合后进入开工状态, 不再干等到夜末
         p = self.night_payload(rod=100, robots=[robot(9, 38, 2)])
         m = Memory(day=1)
-        planner = Planner(Turn.load(p), p, m)
-        self.assertTrue(planner.night_battle_over(), '远处机器人不算阵前威胁')
-        worker = [w for w in planner.turn.workers() if w.unit_id == 2][0]
-        self.assertTrue(planner.preposition(worker), '阵前清空后应当立刻去下一天岗位')
+        first = Planner(Turn.load(p), p, m)
+        self.assertTrue(first.night_battle_over(), '远处机器人不算阵前威胁')
+        self.assertFalse(first.night_work_mode(), '第一回合先按防守(去抖), 不立刻出工')
+        decide_response(p, m)                     # 第 1 个清空回合
+        p['roundNo'] += 1
+        decide_response(p, m)                     # 第 2 个清空回合 -> 进入开工状态
+        p['roundNo'] += 1
+        third = Planner(Turn.load(p), p, m)
+        self.assertTrue(third.night_work_mode(), '连续清空 2 回合后进入开工状态')
+        worker = [w for w in third.turn.workers() if w.unit_id == 2][0]
+        self.assertTrue(third.preposition(worker), '进入开工状态后应当去下一天岗位')
 
     def test_robot_inside_threat_radius_keeps_everyone_on_defense(self):
         p = self.night_payload(rod=100, robots=[robot(1, 12, 25)])
@@ -349,15 +437,19 @@ class NightPrepositionTests(unittest.TestCase):
         worker = [w for w in planner.turn.workers() if w.unit_id == 2][0]
         self.assertFalse(planner.preposition(worker), '阵前有敌时先守炮位')
 
-    def test_worker_leaves_in_the_last_night_rounds(self):
-        p = self.night_payload(rod=126)
+    def test_worker_leaves_after_two_calm_night_rounds(self):
+        # 夜战状态锁: 连续 2 回合阵前清空才出工(防止机器人在半径边缘来回导致反复出工/回塔)
+        p = self.night_payload(rod=124)
         m = Memory(day=1)
+        decide_response(p, m)                     # 第 1 个清空回合(去抖)
+        p['roundNo'] += 1
+        decide_response(p, m)                     # 第 2 个清空回合 -> 开工
+        p['roundNo'] += 1
         planner = Planner(Turn.load(p), p, m)
-        worker = [w for w in planner.turn.workers() if w.unit_id == 2][0]
-        planner.economic.prepare()
-        self.assertTrue(planner.preposition(worker))
-        self.assertEqual(planner.commands['2']['action'], 'move')
-        self.assertIn(2, m.prepositioned)
+        self.assertTrue(planner.night_work_mode())
+        planner.run()
+        self.assertIn(2, m.prepositioned, '连续清空后工人已被记为"已占下一天岗位"')
+        self.assertIn('2', planner.commands, '开工状态应当给工人下达移动/采集指令')
 
     def test_no_preposition_into_a_cell_next_to_a_robot(self):
         p = self.night_payload(rod=126, robots=[robot(1, 6, 22)])
@@ -408,10 +500,9 @@ class NightPrepositionTests(unittest.TestCase):
         # 连续夜末回合: 工人最终应停在矿点旁(而不是被炮位分配反复拉回)
         p = self.night_payload(rod=124)
         m = Memory(day=1)
-        for _ in range(8):
-            planner = Planner(Turn.load(p), p, m)
-            planner.run()
-            command = planner.commands.get('2')
+        for _ in range(16):
+            response = decide_response(p, m)
+            command = response['roleCommandMap'].get('2')
             if command and command['action'] == 'move':
                 for role in p['teamOur']['roles']:
                     if role['id'] == 2:

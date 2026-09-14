@@ -84,14 +84,13 @@ class Economy:
         return level
 
     def wall_voucher_first(self):
-        """围墙升级券是否优先于武器券(用户要求: 优先去购买围墙升级卷)。
+        """围墙升级券是否优先于武器券(用户最新口径)。
 
-        - 第1天: 当天配额只有"两个武器升级", 仍以武器券先行(需求: 第一天完成2个武器升级);
-        - 第2天起: 当天墙配额(4 个前挡升级)存在时, 先买围墙升级券, 配额满足了再买武器券;
-        - 昨夜围墙承伤超过 50%(需求6): 无论哪天都先补围墙券。
+        **无论怎样都是优先升级武器**；只有一种例外: 前夜围墙承伤超过 80%
+        (见 WALL_PRESSURE_RATIO)时, 当天降武器升级、把围墙升级券提到前面。
+        基地受伤时基地升级券仍是第一优先级(见 options() 的 priority=0 分支)。
         """
-        if self.wall_pressure_high(): return True
-        return self.plan()['front_walls'] > 0 and (self.m.day or ((self.turn.round_no-1)//130+1)) > 1
+        return self.wall_pressure_high()
 
     def wall_pressure_high(self):
         """需求6: 第3天起, 若前一晚围墙承伤超过 50%, 当天武器升级让位给围墙升级券。"""
