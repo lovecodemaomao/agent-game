@@ -29,6 +29,10 @@ class Memory:
     day_wall_upgrades: int = 0                         # 当天已完成的围墙升级数
     day_weapon_upgrades: int = 0                       # 当天已完成的武器升级数
     levels: dict = field(default_factory=dict)         # 建筑等级快照: {unit_id: level}
+    station_hit: bool = False                          # 基地是否受过伤(需求3: 触发基地升级券)
+    day_start_gold: int = 0                            # 当天开始时的金币(基地券档位判断)
+    wall_rebuilds: dict = field(default_factory=dict)  # 需求5: {uid: {pos, stage, unit}} 拆墙重建
+    prepositioned: set = field(default_factory=set)    # 需求4: 夜间已去下一天岗位的角色
     day_upgrades: dict = field(default_factory=dict)   # 每日已完成升级: {day: {'wall': n, 'weapon': n}}
     previous_mines: dict = field(default_factory=dict)
     failed_steps: dict = field(default_factory=dict)
@@ -53,6 +57,16 @@ class Memory:
             self.news_attempts = 0
             self.day_wall_upgrades = 0
             self.day_weapon_upgrades = 0
+            self.day_start_gold = turn.gold          # 需求3: "当天白天开始时的金币"
+            self.prepositioned.clear()               # 需求4: 新的一天重新就位防守
+            self.wall_rebuilds.clear()
+        # 基地受伤是永久状态: 只要掉过血就一直记着, 用来触发基地升级券
+        station = turn.station()
+        if station is not None and station.health > 0:
+            from .economy import HP
+            level = max(1, min(3, station.level))
+            if station.health < HP['station'][level-1]:
+                self.station_hit = True
         if any(e.get('errorCode') == 5 for e in payload.get('errors', [])):
             self.llm_used = 3
         roles = {str(r.unit_id): r for r in turn.controllable()}

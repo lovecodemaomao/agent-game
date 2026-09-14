@@ -15,7 +15,8 @@ from test_strategy import fixture, unit
 from agent.brain import Planner, decide_response, wall_sites
 from agent.memory import Memory
 from agent.protocol import Turn, Pos, distance
-from agent.economy import MIN_MINE_BATCH, STATION_FALLBACK_HP, STATION_FALLBACK_DAY
+from agent.economy import (MIN_MINE_BATCH, STATION_FALLBACK_HP, STATION_FALLBACK_DAY,
+                           STATION_URGENT_DAY)
 from agent.tasks import Tasks
 
 
@@ -130,13 +131,27 @@ class StationFallbackTests(unittest.TestCase):
         options = planner.economic.options()
         self.assertEqual(options[0][3], 'StationUpgradeVoucher1', [o[3] for o in options])
 
-    def test_before_day4_low_hp_station_is_not_special(self):
-        p = payload(day=3, gold=200, station_health=STATION_FALLBACK_HP - 100)
-        m = Memory(day=3)
+    def test_day3_damaged_station_is_top_priority(self):
+        # 需求3: 第3天之后基地一受伤, 当天第一优先级就是基地升级券
+        p = payload(day=STATION_URGENT_DAY, gold=200, station_health=900)
+        m = Memory(day=STATION_URGENT_DAY)
+        planner = Planner(Turn.load(p), p, m)
+        options = planner.economic.options()
+        self.assertEqual(options[0][3], 'StationUpgradeVoucher1', [o[3] for o in options])
+
+    def test_station_damage_outranks_weapon_vouchers(self):
+        p = payload(day=STATION_URGENT_DAY, gold=1000, station_health=1400)
+        m = Memory(day=STATION_URGENT_DAY)
+        planner = Planner(Turn.load(p), p, m)
+        self.assertEqual(planner.economic.options()[0][3], 'StationUpgradeVoucher1')
+
+    def test_before_day3_low_hp_station_is_not_special(self):
+        # 第3天之前即使基地掉血也不抢武器/围墙升级的优先级
+        p = payload(day=2, gold=200, station_health=STATION_FALLBACK_HP - 100)
+        m = Memory(day=2)
         planner = Planner(Turn.load(p), p, m)
         items = [o[3] for o in planner.economic.options()]
         self.assertIn('StationUpgradeVoucher1', items)
-        # 第3天仍以围墙/武器配额为先, 基地券不在最前
         self.assertNotEqual(items[0], 'StationUpgradeVoucher1', items)
 
     def test_healthy_station_no_fallback_on_day4(self):
@@ -145,6 +160,20 @@ class StationFallbackTests(unittest.TestCase):
         planner = Planner(Turn.load(p), p, m)
         first = planner.economic.options()[0][3]
         self.assertNotEqual(first, 'StationUpgradeVoucher1')
+
+    def test_tier2_voucher_when_day_starts_rich_and_station_is_level2(self):
+        # 需求3: 白天开始时金币>150 且基地已 2 级 -> 直接买基地升级卷2
+        p = payload(day=STATION_URGENT_DAY, gold=200, station_health=2000)
+        p['teamOur']['roles'][0]['level'] = 2
+        m = Memory(day=STATION_URGENT_DAY, day_start_gold=200)
+        planner = Planner(Turn.load(p), p, m)
+        self.assertEqual(planner.economic.options()[0][3], 'StationUpgradeVoucher2')
+
+    def test_tier1_voucher_when_station_still_level1(self):
+        p = payload(day=STATION_URGENT_DAY, gold=200, station_health=900)
+        m = Memory(day=STATION_URGENT_DAY, day_start_gold=200)
+        planner = Planner(Turn.load(p), p, m)
+        self.assertEqual(planner.economic.options()[0][3], 'StationUpgradeVoucher1')
 
 
 class TaskReuseTests(unittest.TestCase):

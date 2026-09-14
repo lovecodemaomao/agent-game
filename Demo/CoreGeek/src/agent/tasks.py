@@ -15,6 +15,7 @@ import json
 from collections import Counter
 from .protocol import Pos, distance
 from .geography import INF
+from . import templates
 
 # 自进化任务目录与接口约定（赛事环境固定，禁止从 / 全盘递归）
 TASK_DIR = '/tmp/selfEvolutionTask/'
@@ -30,6 +31,28 @@ PROBES = (
      % TASK_DIR),
 )
 PROBE_LIMIT = len(PROBES)
+MIN_TASK_ROUNDS = 6       # 任何任务至少需要的回合数(走位+处理+提交), 低于此不接单
+
+_FAILURE_MARKERS = ('timeout', 'command not found', 'no such file', 'traceback',
+                    'status": "fail', 'not found', '404', '401', '403', 'fail]',
+                    'error:', 'errno', 'permission denied', 'unreachable')
+
+
+def result_looks_ok(result):
+    """预设模板的命令结果是否可用(用于跳过已经不需要的探测阶段)。"""
+    text = str(result or '').strip()
+    if not text or text == '[missing command result]':
+        return False
+    low = text.lower()
+    return not any(marker in low for marker in _FAILURE_MARKERS)
+
+
+def probe_commands(desc):
+    """本轮任务的探测序列: 题干给了文件名就"精确 1 轮定位 + 1 轮线索 grep",
+    否则退回固定目录探测(兼容原有 3 轮流程)。"""
+    if templates.mentioned_files(desc):
+        return (templates.locate_command(desc), PROBES[-1])
+    return PROBES
 
 
 def task_param(text):
@@ -137,7 +160,8 @@ class Tasks:
             self.m.task = {'desc':desc,'start':start,'timeout':int(choice.get('timeoutRounds') or 100),
                            'token':token,'positions':choice.get('positions',[]),
                            'history':[],'proposal':None,'waiting_cmd':False,'skill':'',
-                           'probes':0,'probe_results':[],'probing':False}
+                           'probes':0,'probe_results':[],'probing':False,
+                           'result':'','result_seq':0,'derived_seq':0,'tpl_tries':0,'tpl_last':''}
             # 同类任务快速通道: 题干结构一致(仅参数不同) -> 直接复用已验证的命令
             reusable=self.reusable(desc)
             if reusable:
@@ -182,8 +206,30 @@ class Tasks:
                     self.m.news_attempts += 1
         return held
 
+    def next_day_post(self,role):
+        """需求4: 夜里先把开拓者送到次日任务点旁(只站位, 不领取任务)。"""
+        if self.m.task or self.m.task_choice:
+            return None                     # 已有进行中的任务 -> 不挪位
+        routes = self.p.route(role)
+        best = None
+        for point in self.points():
+            if not point.get('isValid') or point.get('coldDownRounds',0) > 0:
+                continue
+            target = min(point['positions'],key=routes.distance)
+            stand = routes.adjacent(target)
+            if stand is None:
+                continue
+            reward = float(point.get('scoreReward',0)) + float(point.get('goldReward',0))
+            score = reward / max(1,routes.cost[stand])
+            if best is None or score > best[0]:
+                best = (score,stand)
+        return best[1] if best else None
+
     def acquire(self):
         routes = self.p.route(self.pioneer)
+        # 死线管理: 先按题型估出"这个任务要花几回合", 剩余时限不够就不接,
+        # 避免"接受任务后原地超时"(复盘里 task_2_beta 就是这样丢掉的)。
+        budget = templates.estimate(str(self.payload.get('phaseTask') or ''))
         candidates = []
         for point in self.points():
             if not point.get('isValid') or point.get('coldDownRounds',0)>0:
@@ -191,7 +237,13 @@ class Tasks:
             target = min(point['positions'],key=routes.distance)
             # Unknown tasks get a useful initial budget, not the full timeout.
             # Different task families may need many turns; never assume weather.
-            estimated = min(int(point.get('timeoutRounds') or 20),20)
+            estimated = min(int(point.get('timeoutRounds') or budget),budget)
+            allowed = int(point.get('timeoutRounds') or 0)
+            if allowed and allowed < MIN_TASK_ROUNDS + routes.distance(target):
+                # 剩余时限连"走位 + 处理 + 提交"都不够 -> 不接(复盘: r148 接单 r158 超时)
+                self.m.event('task offer skipped: %d rounds left < %d needed'
+                             % (allowed,MIN_TASK_ROUNDS + routes.distance(target)))
+                continue
             if not self.p.enough_time(self.pioneer,routes,target,estimated+1):
                 continue
             reward = float(point.get('scoreReward',0))+float(point.get('goldReward',0))
@@ -209,11 +261,18 @@ class Tasks:
         task = self.m.task
         role = self.pioneer
         if not any(distance(role.pos,q)<=1 for q in task['positions']):
-            # Do not issue executeCmd outside the known task interaction range.
-            return False
+            # 不在任务交互范围内不发 executeCmd; 但已经开始处理的任务若被挤开,
+            # 要自己走回任务点(否则"接了任务却再也不去"= 白丢一个任务)。
+            if not self.turn.is_day or not task['history']:
+                return False
+            routes = self.p.route(role)
+            target = min(task['positions'],key=routes.distance)
+            return self.p.move(role,routes,routes.adjacent(target))
         if task['waiting_cmd']:
             result = str(self.payload.get('lastCmdResult') or '')
             task['history'].append({'result':result[:40000] or '[missing command result]'})
+            task['result'] = result
+            task['result_seq'] = int(task.get('result_seq') or 0)+1
             if task.get('probing'):
                 task['probe_results'].append(result[:20000])
                 task['probing'] = False
@@ -226,7 +285,8 @@ class Tasks:
         # Preserve the task while reasoning, but do not sacrifice mandatory defense.
         deadline = task['start']+task['timeout']
         returning = (not self.turn.is_day or self.p.remaining <= self.p.home_cost(role,role.pos)+5)
-        # 快速通道: 同类任务直接重放已验证命令(零探测、零 LLM 往返)
+        # ① 快速通道: 同类任务直接重放已验证命令(零探测、零 LLM 往返)
+        #    已验证的 SOP 最省回合, 因此排在预设模板之前。
         if task.get('reuse') and not task['waiting_cmd'] and not returning:
             entry=task['reuse']
             if not task.get('reuse_done'):
@@ -265,15 +325,39 @@ class Tasks:
                     '禁止编造结果中不存在的信息。')
             self.send('task',prompt,task['token'])
             return True
-        # 阶段一: 固定探测（只探测任务目录，最多 PROBE_LIMIT 轮，不消耗 LLM 额度）
-        if task.get('probes',0) < PROBE_LIMIT and not task['waiting_cmd'] and not returning:
-            command = PROBES[task['probes']]
+        # ② 模板类任务: 沙盒输出里已经带着答案(TOKEN / 结构化记录) -> 立刻提交, 不等 LLM。
+        if (task.get('tpl_tries') and task.get('result') and not task['waiting_cmd']
+                and not returning
+                and int(task.get('result_seq') or 0) > int(task.get('derived_seq') or 0)):
+            task['derived_seq'] = int(task.get('result_seq') or 0)
+            answer = templates.derive_answer(task['desc'],self.dump(task),task['result'])
+            if answer:
+                return self.submit(task,answer,'preset template')
+        # ③ 题干(或已收集到的信息)足以拼出"一条命令做完"时, 执行预设模板。
+        #    只试一次: 失败就交给通用流程, 不把回合重复花在同一类模板上。
+        if not task['waiting_cmd'] and not returning and not task.get('tpl_tries'):
+            dump = self.dump(task)
+            command = templates.plan(task['desc'],dump)
+            if command:
+                task['tpl_tries'] = 1
+                task['tpl_last'] = command
+                task['waiting_cmd'] = True
+                task['history'].append({'command':command})
+                self.p.execute_cmd = command
+                self.m.event('task: preset %s template' % templates.kind(task['desc'],dump))
+                return True
+        # 阶段一: 固定探测（只探测任务目录，最多 len(probes) 轮，不消耗 LLM 额度）
+        # 预设模板已经跑通时直接进入知识 prompt: 探测只是为了补信息, 不必再花 3 个回合。
+        probes = probe_commands(task['desc'])
+        if (task.get('probes',0) < len(probes) and not task['waiting_cmd'] and not returning
+                and not (task.get('tpl_tries') and result_looks_ok(task.get('result')))):
+            command = probes[task['probes']]
             task['probes'] += 1
             task['probing'] = True
             task['waiting_cmd'] = True
             task['history'].append({'command':command})
             self.p.execute_cmd = command
-            self.m.event(f'task probe {task["probes"]}/{PROBE_LIMIT}')
+            self.m.event(f'task probe {task["probes"]}/{len(probes)}')
             return True
         if proposal:
             if isinstance(proposal.get('skill'),str):
@@ -299,22 +383,40 @@ class Tasks:
         self.send('task',self.knowledge_prompt(task,role),task['token'])
         return True
 
+    def dump(self,task):
+        """已收集到的任务现场信息(定位/探测结果), 供模板与 LLM 复用。"""
+        return '\n'.join(task.get('probe_results') or [])[-40000:]
+
+    def submit(self,task,answer,source=''):
+        """验证通过/数据到手后立刻提交, 不空转。"""
+        role = self.pioneer
+        self.p.commands[str(role.unit_id)]={'action':'submitAnswer','taskAnswer':answer}
+        task['history'].append({'answer':answer[:12000]})
+        task['submitted']=True
+        task['answer']=answer
+        self.m.event('task: submit answer (%s)' % (source or 'task'))
+        return True
+
     def knowledge_prompt(self,task,role):
-        """阶段二: 把 3 轮探测结果一次性喂给 LLM，要求直接给出可用的 API 调用。"""
+        """阶段二: 把探测/定位结果一次性喂给 LLM，要求直接给出可用的命令或答案。"""
         deadline=task['start']+task['timeout']
-        return '''你是比赛开拓者的任务求解器，已完成沙盒任务目录的固定探测。现在直接给出可执行的 API 调用。
+        return '''你是比赛开拓者的任务求解器，已完成沙盒任务目录的定位/探测。现在直接给出可执行的 API 调用或答案。
 只返回一个JSON对象：
 1. 需要调用接口：{"request_id":"原样回传","kind":"command","command":"一条shell命令","skill":"可复用方法"}
 2. 信息已足够作答：{"request_id":"原样回传","kind":"answer","answer":"题目要求的答案","skill":"可复用方法"}
 硬性要求：
-- 命令用 curl 调用探测到的接口，必须带鉴权头 -H "X-API-Key: ''' + HERITAGE_API_KEY + '''"；
+- 命令用 curl 调用探测到的接口，必须带鉴权头 -H "X-API-Key: ''' + HERITAGE_API_KEY + '''"（若接口示例用 Authorization: Bearer，则照示例来）；
 - 参数名与取值必须来自探测结果（文件内容/示例/字段名），不要臆造接口地址；
-- 上一次命令失败或答案不完整时，换不同的参数组合再试（例如 id/序号/名称/日期逐个变化），不要重复同样的命令；
-- 沙盒只允许基础 shell/python，无外网，单次最长 15 秒，输出上限 64KB；命令结果下一回合返回；
-- 拿到关键输出后立刻用 kind=answer 提交，不要空转。
+- **中文参数值必须百分号编码**：用 curl -s -G "<url>" --data-urlencode "city=北京"（直接把中文写进 URL，服务端会按 latin-1 解出乱码）；
+- **把一次调用要试的参数组合写在同一条命令里**（例如同时试 location/city 两种参数名、两种鉴权头），不要用多个回合逐次试错；
+- 检查/验证脚本必须先去掉 Windows 回车再执行：sed -i.bak 's/\r$//' check；修复类任务要把"建目录/改第N行/加执行权限/去CR/跑检查"**一次性**串进同一条命令；
+- 上一次命令失败或答案不完整时换不同的参数组合再试，不要重复同一条命令；
+- 拿到 TOKEN 或完整数据后立刻用 kind=answer 提交（答案原样取自命令输出，禁止编造），不要空转；
+- 沙盒只允许基础 shell/python，无外网，单次最长 15 秒，输出上限 64KB；命令结果下一回合返回。
 '''+json.dumps({'task':task['desc'],'round':self.turn.round_no,
                 'deadline':min(deadline,self.turn.round_no+self.p.remaining-self.p.home_cost(role,role.pos)-5),
                 'probe_results':task.get('probe_results',[])[-PROBE_LIMIT:],
+                'preset_attempt':task.get('tpl_last',''),
                 'history':task['history'][-10:],'known_procedures':self.m.skills[-6:],
                 'errors':self.payload.get('errors',[])},ensure_ascii=False)
 

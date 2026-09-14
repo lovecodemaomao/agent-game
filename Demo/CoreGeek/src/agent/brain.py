@@ -4,20 +4,23 @@ Generic tasks use the judge LLM/sandbox channel; movement and economy stay local
 """
 from collections import Counter
 from itertools import permutations, combinations
+import math
 
 from .grid import Routes, neighbours
 from .memory import Memory
-from .geography import Geography
+from .geography import Geography, INF
 from .economy import Economy
 from .tasks import Tasks
-from .protocol import Pos, Turn, distance, station_footprint, move_command
-from .economy import DAY1_ORE_PHASE_ROUNDS
+from .protocol import (Pos, Turn, build_command, distance, move_command,
+                       station_footprint)
+from .economy import DAY1_ORE_PHASE_ROUNDS, NIGHT_PREPOSITION_ROUND, WALL_MAINTENANCE_DAY
 from .fire_control import plan_fire, select_targets, shot_damage, threat, on_segment
 
 LOADOUT = ("rocket", "rocket", "rocket")   # 要求: 75 金币开局买三座火箭炮
 RETURN_MARGIN = 2          # 回到武器旁的少量安全余量
 INNER_STAND_SLACK = 8      # 夜间交互站位: 为走到"靠基地内侧"最多多走的步数
 RETURN_DEADLINE = 75       # 当天第75回合(含入夜前5回合)前必须回到武器塔旁; 夜间允许移动
+PREPOSITION_SAFE_RADIUS = 8   # 夜间预置站位: 目的地该半径内还有机器人就不去
 
 
 def ring(turn, radius):
@@ -32,15 +35,49 @@ def ring(turn, radius):
                  and turn.land(Pos(x, y)))
 
 
-def wall_sites(turn):
+def wall_sites(turn, extend=0):
+    """迎敌半圈围墙格(由前到后排序)。
+
+    extend>0 时沿围墙弧线在两端各再补 extend 格(需求5: 第3天把半圈从 10 格加长到 12 格)。
+    """
     station = turn.station()
     if station is None:
         return ()
     center_x = station.pos.x + 0.5
     sign = 1 if center_x < turn.width / 2 else -1
     # Forward half of the outer ring. The rear stays open for economic trips.
-    return tuple(sorted((p for p in ring(turn, 2) if sign*(p.x-center_x) > 0),
-                        key=lambda p: (-sign*(p.x-center_x), abs(p.y-(station.pos.y-0.5)), p.y)))
+    sites = [p for p in ring(turn, 2) if sign*(p.x-center_x) > 0]
+    if extend > 0 and sites:
+        sites = sites + _arc_extension(turn, station, sites, extend)
+    return tuple(sorted(sites, key=lambda p: (-sign*(p.x-center_x),
+                                              abs(p.y-(station.pos.y-0.5)), p.y)))
+
+
+def _arc_extension(turn, station, sites, count):
+    """沿环线在围墙弧的两端各补 count 格(按绕基地的角度顺序找相邻的下一格)。"""
+    ordered = sorted(ring(turn, 2), key=lambda p: math.atan2(p.y-(station.pos.y-0.5),
+                                                              p.x-(station.pos.x+0.5)))
+    index = {p: i for i, p in enumerate(ordered)}
+    total = len(ordered)
+    known = [index[p] for p in sites if p in index]
+    if not known or len(known) == total:
+        return []
+    known_set = set(known)
+    start = min(known)
+    for _ in range(total):
+        if (start-1) % total in known_set:
+            start = (start-1) % total
+        else:
+            break
+    end = start
+    for _ in range(total):
+        if (end+1) % total in known_set:
+            end = (end+1) % total
+        else:
+            break
+    extra = [ordered[(start-k) % total] for k in range(1, count+1)]
+    extra += [ordered[(end+k) % total] for k in range(1, count+1)]
+    return [p for p in extra if turn.land(p)]
 
 
 def decide_response(payload, memory=None):
@@ -79,18 +116,31 @@ class Planner:
         self.planned_towers = set()
         self.prices = {x['name']: float(x['price']) for x in payload.get('vendorShopList', [])}
         self.shop_prices = {x['name']: int(x['price']) for x in payload.get('weaponShopList', [])}
-        self.walls = wall_sites(turn)
+        # 需求5: 第3天起迎敌半圈围墙两端各加一格(10 -> 12 格)
+        self.day = self.memory.day or ((turn.round_no-1)//130+1)
+        self.walls = wall_sites(turn, extend=1 if self.day >= WALL_MAINTENANCE_DAY else 0)
         self.home_cost_cache = {}
         # 可用回合预算到当天第 RETURN_DEADLINE 回合为止（含入夜 5 回合, 夜间可移动）
         self.remaining = max(0, RETURN_DEADLINE - (turn.round_no - 1) % 130)
         self.economic = Economy(self)
 
     def route(self, role):
-        forbidden = set(self.reserved)
+        forbidden = set(self.reserved) | self.parking_cells()
         failed = self.memory.failed_steps.get(role.unit_id)
         if failed and failed[1] >= self.turn.round_no:
             forbidden.add(failed[0])
         return Routes(self.turn, role, forbidden)
+
+    def parking_cells(self):
+        """仍待建造的迎敌半圈围墙格 + 计划建造的炮位: 任何角色都不得停留其上。
+
+        人物一旦站上这些格子, 该格就被占住而建不了墙/炮(需求1: 不能卡在
+        面对机器人的那一圈里), 所以把它们从寻路图里排除 —— 既不停留也不穿行,
+        路径会自动绕开这一圈, 不必事后纠偏。
+        """
+        standing = {w.pos for w in self.turn.walls()} | {t.pos for t in self.turn.weapons()}
+        return ({p for p in self.walls if p not in standing}
+                | {p for p in self.build_targets if p not in standing})
 
     def move(self, role, routes, stand):
         if stand is None:
@@ -213,6 +263,7 @@ class Planner:
         if self.payload.get('phaseTask'):
             self.engaged.difference_update(r.unit_id for r in self.turn.alive(('pioneer',)))
         Tasks(self).run()
+        self.pioneer_standby()
         workers = self.turn.workers()
         maintenance = next((r.unit_id for r in workers
                             if self.memory.jobs.get(r.unit_id,{}).get('type')!='upgrade'),None)
@@ -236,9 +287,29 @@ class Planner:
             # 半圈围墙未完成 -> 两名工人一起把墙搭好; 搭好后只留维护工补墙
             if (self.missing_walls() or role.unit_id==maintenance) and self.build_wall(role,routes):
                 continue
+            # 需求5: 第3天起, 掉血的一级墙拆掉重建(石头免费)
+            if self.maintain_walls(role, routes):
+                continue
             self.economic.act(role,routes)
         self.assign_towers(day=True)
         return self.commands
+
+    def pioneer_standby(self):
+        """需求2: 开拓者没有任务可做时去商店旁待命并按计划买券, 不在基地空转。
+
+        任务/寻宝优先级更高(Tasks.run 已先跑过); 只有"确实无事可做"才去商店。
+        """
+        pioneer = next(iter(self.turn.alive(('pioneer',))), None)
+        if pioneer is None or pioneer.unit_id in self.engaged:
+            return False
+        if str(pioneer.unit_id) in self.commands:
+            return False
+        if self.memory.task is not None or self.memory.task_choice:
+            return False
+        if self.economic.shop_standby(pioneer, self.route(pioneer)):
+            self.engaged.add(pioneer.unit_id)
+            return True
+        return False
 
     def build_tower(self, role, routes):
         towers = self.turn.weapons()
@@ -330,14 +401,7 @@ class Planner:
                 return self.interact(role, routes, target, 'collect', targetPos=[target.dump()])
         if not stock and stone_fetcher:
             # Once established, reserve only a small stone batch per trip.
-            mines = [p for p, kind in self.turn.zones.items()
-                     if kind == 'stone' and not self.economic.blocked(p,kind)
-                     and self.economic.mine_claims.get(p, 0) == 0]
-            for target in sorted(mines, key=routes.distance):
-                if not role.backpack_full and self.enough_time(role, routes, target, 3):
-                    self.economic.mine_claims[target] += 1      # 认领, 避免两人同矿
-                    return self.interact(role, routes, target, 'collect', targetPos=[target.dump()])
-            return False
+            return self.fetch_stone(role, routes, 3)
         if not stock:
             return False        # 非采石工且手上无石头 -> 交给经济模块去采矿石
         previous = self.memory.construction_jobs.get(role.unit_id)
@@ -354,6 +418,65 @@ class Planner:
                 return True
         return False
 
+    def fetch_stone(self, role, routes, need=1):
+        """去最近的石矿采够 need 块石头(认领矿点, 避免两名工人争同一矿)。"""
+        if role.backpack_full:
+            return False
+        mines = [p for p, kind in self.turn.zones.items()
+                 if kind == 'stone' and not self.economic.blocked(p, kind)
+                 and self.economic.mine_claims.get(p, 0) == 0]
+        for target in sorted(mines, key=routes.distance):
+            if self.enough_time(role, routes, target, max(1, need)):
+                self.economic.mine_claims[target] += 1
+                return self.interact(role, routes, target, 'collect', targetPos=[target.dump()])
+        return False
+
+    def maintain_walls(self, role, routes):
+        """需求5: 第3天白天, 掉血的一级墙拆掉重建(拆除不回收石头, 重建即回满血)。
+
+        两回合一步: 先站到墙边 remove, 下一回合在原地 build 一块新墙(消耗背包石头)。
+        同时只安排一名工人做重建, 另一名继续挣钱; 掉血的二级墙交给修复包链路。
+        """
+        if not self.turn.is_day:
+            return False
+        job = self.memory.wall_rebuilds.get(role.unit_id)
+        if job is not None:
+            alive = any(w.pos == job['pos'] for w in self.turn.walls())
+            stale = job['pos'] not in self.walls or (job['stage'] == 'build' and alive)
+            if stale:
+                self.memory.wall_rebuilds.pop(role.unit_id, None)
+                job = None
+        if job is None:
+            if self.memory.wall_rebuilds:
+                return False        # 已有工人在重建, 不重复派人
+            targets = self.economic.rebuild_targets()
+            if not targets:
+                return False
+            best = min(targets, key=lambda w: routes.distance(w.pos))
+            if routes.distance(best.pos) >= INF:
+                return False
+            if not self.enough_time(role, routes, best.pos, 3):    # 拆除 + 重建两回合
+                return False
+            job = {'pos': best.pos, 'stage': 'remove', 'unit': best.unit_id}
+            self.memory.wall_rebuilds[role.unit_id] = job
+            self.memory.event(f'worker {role.unit_id}: rebuild damaged level-1 wall {best.unit_id}')
+        if job['stage'] == 'remove':
+            if distance(role.pos, job['pos']) <= 1:
+                self.commands[str(role.unit_id)] = {'action': 'remove',
+                                                    'targetPos': [job['pos'].dump()]}
+                job['stage'] = 'build'
+                self.memory.construction_jobs[role.unit_id] = ('wall', job['pos'])
+                return True
+            return self.move(role, routes, routes.adjacent(job['pos']))
+        if role.backpack.count('stone') < 1:
+            return self.fetch_stone(role, routes, 1)      # 先备料再重建
+        if distance(role.pos, job['pos']) <= 1:
+            self.commands[str(role.unit_id)] = build_command(job['pos'], 'wall')
+            self.memory.wall_rebuilds.pop(role.unit_id, None)
+            self.build_targets.add(job['pos'])
+            return True
+        return self.move(role, routes, routes.adjacent(job['pos']))
+
     def upgrade_options(self):
         return self.economic.options()
 
@@ -365,8 +488,60 @@ class Planner:
         self.economic.prepare()
         return self.economic.act(role,routes)
 
+    def night_battle_over(self):
+        """需求4: 夜战是否已结束(机器人清空, 或已到夜末且附近无威胁)。"""
+        rod = (self.turn.round_no-1) % 130 + 1
+        towers = [t.pos for t in self.turn.weapons()]
+        living = [r for r in self.turn.robots if r.health > 0]
+        if any(towers and min(distance(r.pos, p) for p in towers) <= PREPOSITION_SAFE_RADIUS
+               for r in living):
+            return False                     # 阵前还有敌人 -> 留在炮位
+        if not living:
+            return True
+        return rod >= NIGHT_PREPOSITION_ROUND
+
+    def post_target(self, role, routes):
+        """下一天的岗位: 开拓者 -> 任务点旁; 工人 -> 次日矿点的采集邻格。"""
+        if role.kind == 'pioneer':
+            return Tasks(self).next_day_post(role)
+        return self.economic.next_day_mine(role, routes)
+
+    def continue_preposition(self, role):
+        """已在去岗位路上的角色继续走 —— 它们离开了炮位, 不会出现在 ready 里。"""
+        if role.unit_id not in self.memory.prepositioned:
+            return False
+        routes = self.route(role)
+        stand = self.post_target(role, routes)
+        if stand is None or stand == role.pos:
+            return False
+        return self.move(role, routes, stand)
+
+    def preposition(self, role):
+        """需求4: 夜战结束后先去占下一天的岗位 —— 工人到次日矿点旁, 开拓者到任务点旁。"""
+        if role.unit_id in self.memory.prepositioned:
+            return True                      # 已经在去岗位的路上, 不再被炮位分配拉回
+        if not self.night_battle_over():
+            return False
+        station = self.turn.station()
+        if station is None:
+            return False
+        routes = self.route(role)
+        stand = self.post_target(role, routes)
+        if stand is None or stand == role.pos:
+            return False
+        if distance(stand, station.pos) <= 2:
+            return False                     # 本来就在基地旁, 不必挪
+        if any(r.health > 0 and distance(r.pos, stand) <= PREPOSITION_SAFE_RADIUS
+               for r in self.turn.robots):
+            return False                     # 目的地附近还有机器人 -> 不冒险
+        self.memory.prepositioned.add(role.unit_id)
+        self.memory.event(f'role {role.unit_id}: night move to next-day post {stand}')
+        return self.move(role, routes, stand)
+
     def assign_towers(self, day=False):
-        roles = [r for r in self.turn.controllable() if str(r.unit_id) not in self.commands and r.unit_id not in self.engaged]
+        roles = [r for r in self.turn.controllable() if str(r.unit_id) not in self.commands
+                 and r.unit_id not in self.engaged
+                 and r.unit_id not in self.memory.prepositioned]
         towers = list(self.turn.weapons())
         if not roles or not towers:
             return []
@@ -419,3 +594,10 @@ class Planner:
                     self.commands[str(role.unit_id)] = {'action':'use','name':item,
                                                         'targetPos':[target.pos.dump()]}
                     serviced.add(target.unit_id)
+                elif self.preposition(role):
+                    continue
+        # 需求4: 已经离开炮位去占下一天岗位的角色继续前进
+        for role in self.turn.controllable():
+            if str(role.unit_id) in self.commands:
+                continue
+            self.continue_preposition(role)

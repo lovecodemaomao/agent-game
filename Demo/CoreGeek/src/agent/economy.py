@@ -4,6 +4,8 @@ from .geography import INF
 from .protocol import distance
 
 ORES=('stone','iron','copper')
+SELLABLE=('iron','copper')                 # 需求5: 石头不卖, 只用于建墙/修墙(重建)
+STONE='stone'
 SUMMON_ORDER='LargeRobotSummonOrder'      # 大机器人召唤令(需求: 第一天金钱>100优先购买)
 SUMMON_ORDER_TRIGGER=100
 RETURN_MARGIN=5                           # 与 brain.RETURN_MARGIN 保持一致
@@ -21,11 +23,16 @@ DAY_PLAN={1:{'front_walls':0,'weapons':2},
           3:{'front_walls':4,'weapons':2}}
 DAY_PLAN_DEFAULT={'front_walls':4,'weapons':2}
 DAY1_ORE_PHASE_ROUNDS=30                  # 第1天先赚钱: 前30回合全员采铁/铜, 之后再采石修墙
+DAY_ROUNDS=70                            # 白天回合数(夜间预置站位按整日预算选矿)
 SPEND_WALL_VOUCHER=20                     # 回家前清钱: 围墙券价(参考)
 SPEND_FIXER=10                            # 回家前清钱: 修复包价
 SPEND_TRIP_SLACK=3                        # 清钱时点余量(回合)
-STATION_FALLBACK_HP=1000                  # 兜底: 撑过第3夜后基地低于该血量 -> 优先升级基地
-STATION_FALLBACK_DAY=4                    # 兜底生效的最早天数
+STATION_FALLBACK_HP=1000                  # 保留: 旧兜底阈值(现由"受伤即优先"取代)
+STATION_FALLBACK_DAY=4                    # 保留: 旧兜底天数
+WALL_MAINTENANCE_DAY=3                   # 需求5: 第3天起掉血的墙要重建/修复
+NIGHT_PREPOSITION_ROUND=124               # 需求4: 夜末若干回合开始为下一天预置站位
+STATION_URGENT_DAY=3                      # 需求3: 第3天起, 基地一受伤就优先买基地升级券
+STATION_TIER2_GOLD=150                    # 需求3: 白天开始时金币>150 且已2级 -> 直接上2级券
 FRONT_REPAIR_RATIO=0.7                    # 面向机器人的前排墙: 血量低于该比例即主动修复
 ANY_REPAIR_RATIO=0.5                      # 其余围墙: 低于该比例即修复
 CRITICAL_REPAIR_RATIO=0.25                # 濒临被打爆: 即使要现买修复包也优先于升级
@@ -45,14 +52,54 @@ class Economy:
     def plan(self):
         return DAY_PLAN.get(self.m.day or ((self.turn.round_no-1)//130+1), DAY_PLAN_DEFAULT)
 
+    def repair_threshold(self,wall):
+        """围墙修复阈值: 第1-2天只有明显受损才修; 第3天起"掉一格血就算受损"(需求5)。"""
+        if (self.m.day or ((self.turn.round_no-1)//130+1))>=WALL_MAINTENANCE_DAY:
+            return 1.0
+        return FRONT_REPAIR_RATIO if wall.pos in self.p.walls else ANY_REPAIR_RATIO
+
     def damaged_walls(self):
-        """低于修复阈值的围墙（面向机器人的前排墙阈值更宽松）。"""
+        """低于修复阈值的围墙（前排墙阈值更宽松; 第3天起掉血即为受损）。"""
         out=[]
         for w in self.turn.walls():
             level=max(1,min(3,w.level)); ratio=w.health/HP['wall'][level-1]
-            thr=FRONT_REPAIR_RATIO if w.pos in self.p.walls else ANY_REPAIR_RATIO
-            if ratio<thr: out.append(w)
+            if ratio<self.repair_threshold(w): out.append(w)
         return out
+
+    def rebuild_targets(self):
+        """需求5: 第3天起, 掉血的一级墙拆掉重建(石头免费, 重建即回满血)。"""
+        if not self.turn.is_day: return []
+        if (self.m.day or ((self.turn.round_no-1)//130+1))<WALL_MAINTENANCE_DAY: return []
+        planned={j.get('unit') for j in self.m.jobs.values() if j.get('type')=='upgrade'}
+        out=[]
+        for w in self.turn.walls():
+            if max(1,min(3,w.level))!=1: continue
+            if w.health>=HP['wall'][0]: continue
+            if w.pos not in self.p.walls: continue
+            if w.unit_id in planned: continue        # 正在被升级券回血的墙不重建
+            out.append(w)
+        return out
+
+    def station_urgent(self):
+        """需求3: 第3天之后只要基地受过伤, 当天第一优先级就是买基地升级券。
+
+        档位(用户给定): 当天白天开始时金币>150 且基地已 2 级 -> 买基地升级卷2,
+        否则买当前等级的基地升级卷1; 券在夜晚回家时使用。
+        """
+        station=self.turn.station()
+        if station is None or station.health<=0: return False
+        level=max(1,min(3,station.level))
+        if level>=3: return False
+        day=self.m.day or ((self.turn.round_no-1)//130+1)
+        if day<STATION_URGENT_DAY: return False
+        return bool(self.m.station_hit) or station.health<HP['station'][level-1]
+
+    def station_tier(self):
+        """基地升级券档位: 白天开始时金币>150 且已 2 级 -> 2 级券, 其余买当前等级。"""
+        station=self.turn.station()
+        level=max(1,min(3,station.level)) if station is not None else 1
+        if self.m.day_start_gold>STATION_TIER2_GOLD and level>=2: return 2
+        return level
 
     def wall_quota_left(self):
         """当天还需完成的围墙升级数量（没有可升级的围墙时视为已完成）。"""
@@ -96,19 +143,21 @@ class Economy:
             front = u.kind=='wall' and u.pos in self.p.walls
             # 主动防御修复: 面向机器人的前排墙血量<70% 即修(不等被打爆), 其余墙<50% 才修;
             # 手上已有修复包 -> 最高优先级(不花金币); 需现买则排在武器/围墙升级之后。
-            if u.kind=='wall' and ratio < (FRONT_REPAIR_RATIO if front else ANY_REPAIR_RATIO) \
+            if u.kind=='wall' and level==1 and ratio<1.0 and self.turn.is_day \
+                    and (self.m.day or ((self.turn.round_no-1)//130+1))>=WALL_MAINTENANCE_DAY:
+                continue        # 需求5: 掉血的一级墙改用"拆掉重建"(石头), 不占用修复包/升级券
+            if u.kind=='wall' and ratio < self.repair_threshold(u) \
                     and (level>=3 or held_fixer):
                 # 手上没修复包时按严重度: 濒临被打爆(<25%)优先于武器升级, 否则排在升级之后
                 item='WallFixer'
                 priority = 0 if held_fixer else (0.3 if ratio<CRITICAL_REPAIR_RATIO else 2.6)
             elif u.kind=='wall' and level==3:
-                if ratio>=FRONT_REPAIR_RATIO: continue
+                if ratio>=self.repair_threshold(u): continue
                 item='WallFixer'; priority=4 if held_fixer else 4.5
             elif (u.kind=='station' and level<3
-                  and ((ratio<0.6)
-                       or (self.m.day>=STATION_FALLBACK_DAY
-                           and u.health<STATION_FALLBACK_HP))):
-                item=f'StationUpgradeVoucher{level}'; priority=0
+                  and ((ratio<0.6) or self.station_urgent())):
+                # 需求3: 第3天之后基地一受伤, 当天第一优先级就是基地升级券
+                item=f'StationUpgradeVoucher{self.station_tier()}'; priority=0
             else:
                 if level>=3: continue
                 prefix='Station' if u.kind=='station' else 'Wall' if u.kind=='wall' else 'Weapon'
@@ -181,7 +230,11 @@ class Economy:
             prefix,level=item.split('UpgradeVoucher')
             kinds={'Weapon':('rocket','railgun','gatling'),'Wall':('wall',),'Station':('station',)}
             targets=sum(u.health>0 and u.kind in kinds.get(prefix,()) and u.level==int(level)
-                        and u.unit_id not in assigned for u in self.turn.ours)
+                        and u.unit_id not in assigned
+                        and not (prefix=='Wall' and int(level)==1
+                                 and u.health<HP['wall'][0] and self.turn.is_day
+                                 and (self.m.day or ((self.turn.round_no-1)//130+1))>=WALL_MAINTENANCE_DAY)
+                        for u in self.turn.ours)
             held=sum(r.backpack.count(item) for r in self.turn.controllable())
             limit=min(limit,max(0,targets-held))
         return max(0,limit)
@@ -429,6 +482,61 @@ class Economy:
             return True
         return self.p.move(role,routes,stand)
 
+    def shop_standby(self,role,routes):
+        """需求2: 开拓者没有任务可做时, 不要在基地闲着 —— 去商店旁待命按计划买券。
+
+        时机判据与工人采购一致: "去商店 + 买 + 回武器塔"必须还在当天死线之内;
+        越接近天黑越早收手, 交回 assign_towers 把它送回武器塔旁(天黑前归位)。
+        """
+        if not self.turn.is_day or role.backpack_full: return False
+        shop=self._nearest_shop(routes)
+        if shop is None: return False
+        stand=routes.adjacent(shop)
+        if stand is None: return False
+        trip=routes.cost[stand]+1+self.p.home_cost(role,stand)
+        if trip>self.p.remaining: return False        # 来不及 -> 让位给"回家"逻辑
+        if distance(role.pos,shop)<=1 or stand==role.pos:
+            # 已站到商店旁: 有券就买; 没得买也留在店里等钱/等任务(不回基地空转)
+            self.buy_at_shop(role)
+            return True
+        return self.p.move(role,routes,stand)
+
+    def buy_at_shop(self,role):
+        """按既定购买计划买券: 计划内最高优先级且买得起的, 一次买够(批量采购)。
+
+        计划顺序与工人采购共用 self.options(): 武器升级券优先 -> 围墙券 -> 基地券;
+        计划内都买不起/已买够时, 用闲钱补修复包(与工人共享库存上限, 不会重复买)。
+        与"回家清钱"同一条纪律: 武器还没满级且当前买不起武器券时, 不把钱花在
+        围墙券/修复包上(攒着先升武器) —— 否则第一天的金币会被围墙券吃掉。
+        """
+        candidates=list(self.options())
+        needs_weapon=any(max(1,min(3,w.level))<3 for w in self.turn.weapons())
+        affordable_weapon=any(self.p.shop_prices.get(item,10**9)<=self.p.gold
+                              for _,_,_,item,_ in candidates if item.startswith('Weapon'))
+        if needs_weapon and self.weapon_quota_left()>0 and not affordable_weapon:
+            return False
+        for _,level,uid,item,target in candidates:
+            price=self.p.shop_prices.get(item)
+            if price is None or price<=0: continue
+            need=(self.wall_quota_left() if item.startswith('Wall')
+                  else self.weapon_quota_left() if item.startswith('Weapon') else 1)
+            num=self.purchase_count(role,item,price,max(1,need))
+            if num<1: continue
+            self.p.commands[str(role.unit_id)]={'action':'buy','name':item,'num':num}
+            self.p.gold-=price*num
+            self.m.event(f'pioneer {role.unit_id}: standby purchase {num}x {item} for {uid}')
+            return True
+        price=self.p.shop_prices.get('WallFixer')
+        if price is None or not self.turn.walls() or self.p.gold<price: return False
+        if any(j.get('item')=='WallFixer' for j in self.m.jobs.values()): return False
+        stock=sum(r.backpack.count('WallFixer') for r in self.turn.controllable())
+        if stock>=WALL_FIXER_RESERVE: return False
+        num=max(1,min(WALL_FIXER_RESERVE-stock,int(self.p.gold//price)))
+        self.p.commands[str(role.unit_id)]={'action':'buy','name':'WallFixer','num':num}
+        self.p.gold-=price*num
+        self.m.event(f'pioneer {role.unit_id}: standby purchase {num}x WallFixer')
+        return True
+
     def harvest_near_home(self,role,routes):
         """需求3: 白天回防途中在家附近顺手采矿。
 
@@ -508,6 +616,22 @@ class Economy:
             return True
         return False
 
+    def next_day_mine(self,role,routes):
+        """需求4: 夜间为下一天挑矿点, 返回应站到的采集邻格(方便次日开采)。
+
+        评分沿用白天的"金币/回合"(含到小贩与回防的完整行程), 但预算按新的一天
+        75 回合算, 避免夜间 remaining=0 导致一个候选都算不出来。
+        """
+        kinds=self.wanted_kinds(role)
+        candidates=self.mining_candidates(role,routes,kinds,horizon=DAY_ROUNDS)
+        if not candidates:
+            candidates=self.mining_candidates(role,routes,horizon=DAY_ROUNDS)
+        if not candidates: return None
+        best=max(candidates,key=lambda c:(c['score'],-c['total']))
+        # 认领该矿: 两名工人夜间预置站位时不要挑到同一个矿(要求6)
+        self.mine_claims[best['target']]+=1
+        return best['entry']
+
     def blocked(self,pos,kind):
         if self.m.mine_blocked_until.get(pos,0)>self.turn.round_no: return True
         return any(e['kind']==kind and e['start_day']<=self.m.day<=e['end_day']
@@ -515,11 +639,12 @@ class Economy:
 
     # ---------------------------------------------------------------- 矿工分工
     def stone_needed(self):
-        """是否还需要采石: 建墙缺格 或 在途石头不足以补齐。"""
+        """是否还需要采石: 建墙缺格、待重建的掉血一级墙, 或手上石料不足。"""
         missing=len(self.p.missing_walls())
-        if missing<=0: return False
+        rebuilds=len(self.rebuild_targets())
+        if missing<=0 and rebuilds<=0: return False
         stock=sum(r.backpack.count('stone') for r in self.turn.workers())
-        return stock<missing
+        return stock<missing+rebuilds
 
     def family(self,role):
         """采石/采矿的统筹（要求3、5）:
@@ -540,7 +665,8 @@ class Economy:
         return ('iron','copper')          # 赚钱阶段优先铁/铜(单价高)
 
     def sale_candidates(self,role,routes,extra=None):
-        stock=Counter(x for x in role.backpack if x in ORES)
+        # 需求5: 石头不卖 —— 只把小贩收购的矿石列入出售候选, 石头留给建墙/重建
+        stock=Counter(x for x in role.backpack if x in SELLABLE)
         if extra: stock.update(extra)
         if not stock: return []
         value=sum(n*self.p.prices.get(k,0) for k,n in stock.items())
@@ -556,10 +682,13 @@ class Economy:
                         'vendor':vendor,'seat':seat,'total':total,'stock':stock,'value':value})
         return candidates
 
-    def mining_candidates(self,role,routes,kinds=None):
+    def mining_candidates(self,role,routes,kinds=None,horizon=None):
+        """矿点候选。horizon 用于"夜间为下一天预置站位": 按新的一天预算评估,
+        不受当天剩余回合(夜间为 0)限制。"""
         capacity=max(0,(role.capacity or 100)-len(role.backpack))
         if not capacity: return []
-        stock=Counter(x for x in role.backpack if x in ORES)
+        remaining=self.p.remaining if horizon is None else horizon
+        stock=Counter(x for x in role.backpack if x in SELLABLE)
         inventory_value=sum(n*self.p.prices.get(k,0) for k,n in stock.items())
         candidates=[]
         vendors=[q for q,k in self.turn.zones.items() if k=='vendor']
@@ -583,7 +712,7 @@ class Economy:
                     for exit in self.p.geo.seats(vendor):
                         trip=self.p.geo.field([exit]).get(entry,INF)
                         home=self.p.home_cost(role,exit)
-                        max_q=min(quantity,self.p.remaining-approach-trip-sales-home-6)
+                        max_q=min(quantity,remaining-approach-trip-sales-home-6)
                         if max_q<1: continue
                         for q in range(1,int(max_q)+1):
                             # 评分 = 金币/回合: 分母含"去矿 + 采集 + 去小贩 + 回家"全程,
@@ -596,7 +725,7 @@ class Economy:
         return candidates
 
     def sell(self,role,routes,job):
-        stock=Counter(x for x in role.backpack if x in ORES)
+        stock=Counter(x for x in role.backpack if x in SELLABLE)
         if not stock:
             self.m.jobs.pop(role.unit_id,None)
             return False
