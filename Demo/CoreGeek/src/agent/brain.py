@@ -15,11 +15,12 @@ from .protocol import (Pos, Turn, build_command, distance, move_command,
                        station_footprint)
 from .economy import (DAY1_ORE_PHASE_ROUNDS, DAY_ROUNDS, WALL_MAINTENANCE_DAY)
 from .fire_control import plan_fire, select_targets, shot_damage, threat, on_segment
+from . import fire_control as combat
 
-LOADOUT = ("rocket", "rocket", "rocket")   # 要求: 75 金币开局买三座火箭炮
+LOADOUT = ("rocket", "rocket", "railgun")
 RETURN_MARGIN = 2          # 回到武器旁的少量安全余量
 INNER_STAND_SLACK = 8      # 夜间交互站位: 为走到"靠基地内侧"最多多走的步数
-RETURN_DEADLINE = 75       # 当天第75回合(含入夜前5回合)前必须回到武器塔旁; 夜间允许移动
+RETURN_DEADLINE = 75       # Legacy economic horizon; gated bases enforce day 70 below.
 PREPOSITION_SAFE_RADIUS = 8   # 夜间预置站位: 目的地该半径内还有机器人就不去
 THREAT_RADIUS = 10            # 夜战结束判定: 基地/炮位该半径内还有活机器人就继续防守
                               #   (与火箭炮 1 级射程 10 对齐; 不再用固定夜末回合数等待)
@@ -49,10 +50,12 @@ def wall_sites(turn, extend=0):
     sign = 1 if center_x < turn.width / 2 else -1
     # Forward half of the outer ring. The rear stays open for economic trips.
     sites = [p for p in ring(turn, 2) if sign*(p.x-center_x) > 0]
-    if extend > 0 and sites:
-        sites = sites + _arc_extension(turn, station, sites, extend)
-    return tuple(sorted(sites, key=lambda p: (-sign*(p.x-center_x),
+    day = (turn.round_no-1)//130+1
+    if day >= 3:
+        sites = list(ring(turn, 2))
+    ordered = tuple(sorted(sites, key=lambda p: (-sign*(p.x-center_x),
                                               abs(p.y-(station.pos.y-0.5)), p.y)))
+    return ordered[:4] if day == 1 else ordered
 
 
 def _arc_extension(turn, station, sites, count):
@@ -120,9 +123,10 @@ class Planner:
         self.shop_prices = {x['name']: int(x['price']) for x in payload.get('weaponShopList', [])}
         # 需求5: 第3天起迎敌半圈围墙两端各加一格(10 -> 12 格)
         self.day = self.memory.day or ((turn.round_no-1)//130+1)
-        self.walls = wall_sites(turn, extend=1 if self.day >= WALL_MAINTENANCE_DAY else 0)
+        self.walls = wall_sites(turn)
         self.home_cost_cache = {}
         self.route_cache = {}
+        self.select_gate()
         # 可用回合预算: 白天到当天第 RETURN_DEADLINE 回合为止(含入夜 5 回合)。
         # 夜间在"夜战结束"后可以直接开工(需求4: 夜间可采矿/做任务), 此时把预算
         # 设成"一个完整白天"(RETURN_DEADLINE) —— 与次日白天的预算一致, 这样夜间
@@ -131,12 +135,114 @@ class Planner:
         # 夜间是否处于"开工"状态: 用 memory 的状态锁(连续清空才开工), 不是逐回合瞬时判定
         self.battle_over = (self.memory.night_mode == 'work')
         if turn.is_day:
-            self.remaining = max(0, RETURN_DEADLINE - (turn.round_no - 1) % 130)
+            self.remaining = max(0, (70 if self.day>=3 else RETURN_DEADLINE) - (turn.round_no - 1) % 130)
         elif self.battle_over:
             self.remaining = RETURN_DEADLINE
         else:
             self.remaining = 0
         self.economic = Economy(self)
+
+    def base_distance(self, pos):
+        return min(distance(pos,q) for q in station_footprint(self.turn.station().pos))
+
+    def select_gate(self):
+        station = self.turn.station()
+        if station is None:
+            return
+        sites = ring(self.turn,2)
+        if self.memory.gate_pos in sites:
+            return
+        sign = 1 if station.pos.x+.5 < self.turn.width/2 else -1
+        existing = {w.pos:w for w in self.turn.walls()}
+        candidates = [p for p in sites if p not in existing or existing[p].level == 1]
+        candidates = [p for p in candidates if any(self.base_distance(q)==1 and self.turn.land(q)
+                      and q not in {t.pos for t in self.turn.weapons()} for q in neighbours(p))
+                      and any(self.base_distance(q)==3 and self.turn.land(q) for q in neighbours(p))]
+        self.memory.gate_pos = min(candidates, key=lambda p:(sign*(p.x-station.pos.x),
+            abs(p.y-(station.pos.y-.5)),p.y), default=None)
+
+    def wall_group(self, pos):
+        if pos == self.memory.gate_pos:
+            return 3
+        station = self.turn.station()
+        sign = 1 if station.pos.x+.5 < self.turn.width/2 else -1
+        projection = sign*(pos.x-(station.pos.x+.5))
+        return 0 if projection >= 2 else 2 if projection <= -2 else 1
+
+    def gate_wall(self):
+        return next((w for w in self.turn.walls() if w.pos == self.memory.gate_pos),None)
+
+    def manage_gate(self):
+        """Observed-state daytime transaction. Never assume remove/build succeeded."""
+        gate = self.memory.gate_pos
+        if not self.turn.is_day or self.day < 3 or gate is None:
+            return False
+        wall = self.gate_wall()
+        self.memory.gate_state = 'closed' if wall else 'open'
+        roles = self.turn.controllable()
+        workers = self.turn.workers()
+        if not workers:
+            return False
+        rod = (self.turn.round_no-1)%130+1
+        # A closed gate is opened while there is useful daylight, by a worker.
+        if wall and rod < 50:
+            worker = min(workers,key=lambda r:(self.route(r).distance(gate),r.unit_id))
+            if wall.level == 1 and self.interact(worker,self.route(worker),gate,'remove',targetPos=[gate.dump()]):
+                self.engaged.add(worker.unit_id)
+                self.memory.gate_state = 'opening'
+            return False
+        paths = {r.unit_id:self.route(r) for r in roles}
+        outside = [r for r in roles if self.base_distance(r.pos)>1]
+        home = {r.unit_id:min((paths[r.unit_id].cost.get(q,INF) for q in ring(self.turn,1)
+                              if q not in self.turn.blocked(r)),default=INF) for r in outside}
+        return_now = rod >= min(60,70-max(home.values(),default=0)-len(roles)-2)
+        if not return_now:
+            return False
+        keeper = min(workers,key=lambda r:('stone' not in r.backpack,
+            self.route(r).distance(gate),r.unit_id))
+        self.memory.gate_keeper = keeper.unit_id
+        for r in roles:
+            self.engaged.add(r.unit_id)
+            self.memory.jobs.pop(r.unit_id,None)
+            if self.base_distance(r.pos)>1:
+                seats = [q for q in ring(self.turn,1) if q in self.route(r).cost
+                         and q not in self.reserved]
+                self.move(r,self.route(r),min(seats,key=lambda q:(self.route(r).cost[q],q.x,q.y),default=None))
+        if not outside and wall is None and gate not in self.turn.occupied_cells():
+            routes = self.route(keeper)
+            if 'stone' in keeper.backpack:
+                seats = [q for q in neighbours(gate) if self.base_distance(q)==1 and q in routes.cost]
+                stand = min(seats,key=lambda q:(routes.cost[q],q.x,q.y),default=None)
+                if stand == keeper.pos:
+                    self.commands[str(keeper.unit_id)] = build_command(gate,'wall')
+                    self.memory.gate_state = 'closing'
+                else:
+                    self.move(keeper,routes,stand)
+            else:
+                self.memory.event('gate remains open: no stone before dawn deadline')
+        elif not outside and wall is not None:
+            self.engaged.clear()
+            self.assign_towers(day=True)
+        return True
+
+    def clear_construction_seats(self):
+        """An idle pioneer must not occupy a corner wall's sole interior build seat."""
+        if self.payload.get('phaseTask') or self.memory.task:
+            return
+        seats = set()
+        inner = set(ring(self.turn,1))
+        for pos in self.missing_walls():
+            possible = set(neighbours(pos)) & inner
+            if len(possible)==1:
+                seats |= possible
+        for role in self.turn.alive(('pioneer',)):
+            if role.pos not in seats or str(role.unit_id) in self.commands:
+                continue
+            routes=self.route(role)
+            candidates=[q for q in inner-seats if q in routes.cost and q not in self.reserved]
+            stand=min(candidates,key=lambda q:(routes.cost[q],q.x,q.y),default=None)
+            if stand is not None and self.move(role,routes,stand):
+                self.engaged.add(role.unit_id)
 
     def route(self, role):
         forbidden = set(self.reserved) | self.parking_cells()
@@ -160,7 +266,7 @@ class Planner:
         路径会自动绕开这一圈, 不必事后纠偏。
         """
         standing = {w.pos for w in self.turn.walls()} | {t.pos for t in self.turn.weapons()}
-        return ({p for p in self.walls if p not in standing}
+        return ({p for p in self.walls if p not in standing and p != self.memory.gate_pos}
                 | {p for p in self.build_targets if p not in standing})
 
     def move(self, role, routes, stand):
@@ -280,6 +386,9 @@ class Planner:
                 tasks.receive()
             self.night()
             return self.commands
+        if self.manage_gate():
+            return self.commands
+        self.clear_construction_seats()
         if self.payload.get('phaseTask'):
             self.engaged.update(r.unit_id for r in self.turn.alive(('pioneer',)))
         self.economic.prepare()
@@ -302,9 +411,20 @@ class Planner:
         maintenance = next((r.unit_id for r in workers
                             if self.memory.jobs.get(r.unit_id,{}).get('type')!='upgrade'),None)
         for role in workers:
-            if role.unit_id in self.engaged:
+            if role.unit_id in self.engaged or str(role.unit_id) in self.commands:
                 continue
             routes = self.route(role)
+            job = self.memory.jobs.get(role.unit_id,{})
+            target = self.economic.target(job) if job.get('type')=='upgrade' else None
+            if target and job.get('bought') and routes.distance(target.pos)==0 and self.economic.upgrade(role,routes):
+                continue
+            if (self.day >= 3 and not self.gate_wall()
+                    and not any('stone' in w.backpack for w in workers)
+                    and role.unit_id == min(w.unit_id for w in workers)
+                    and self.fetch_stone(role,routes,1)):
+                continue
+            if self.economic.maintain_wall(role,routes):
+                continue
             # Using a voucher in place takes one turn and must not be suppressed
             # by the generic five-turn return margin.
             if self.economic.act_urgent(role,routes):
@@ -353,7 +473,8 @@ class Planner:
         blocked = self.turn.occupied_cells() | self.reserved | self.build_targets
         candidates = [p for p in ring(self.turn, 1) if p not in blocked]
         previous = self.memory.construction_jobs.get(role.unit_id)
-        candidates.sort(key=lambda p: (previous != (kind, p), routes.distance(p), p.x, p.y))
+        preferred = self.fleet_layout(kind)
+        candidates.sort(key=lambda p: (p not in preferred, routes.distance(p), previous != (kind, p), p.x, p.y))
         for target in candidates:
             if not self.construction_accessible(target, tower=True):
                 continue
@@ -376,11 +497,49 @@ class Planner:
                 return True
         return False
 
+    def fleet_layout(self, kind):
+        """Prefer front rockets sharing a safe interior seat and a separate rail seat."""
+        existing = list(self.turn.weapons())
+        fixed_rockets = {t.pos for t in existing if t.kind=='rocket'}
+        fixed_rail = {t.pos for t in existing if t.kind=='railgun'}
+        fixed_rockets |= {p for p in self.planned_towers if p not in fixed_rail}
+        cells = set(ring(self.turn,1))
+        station = self.turn.station(); sign = 1 if station.pos.x < self.turn.width/2 else -1
+        best = None
+        for a,b in combinations(sorted(cells,key=lambda q:(q.x,q.y)),2):
+            if not fixed_rockets <= {a,b}:
+                continue
+            for rail in cells-{a,b}:
+                if fixed_rail and rail not in fixed_rail:
+                    continue
+                fleet = {a,b,rail}
+                seats = cells-fleet
+                shared = set(neighbours(a)) & set(neighbours(b)) & seats
+                if not shared or not (set(neighbours(rail)) & seats):
+                    continue
+                gate_seats = set(neighbours(self.memory.gate_pos)) & seats if self.memory.gate_pos else seats
+                if not gate_seats:
+                    continue
+                seen = set(gate_seats)
+                for _ in range(len(seats)):
+                    seen |= {q for p in seen for q in neighbours(p) if q in seats}
+                if not seats <= seen:
+                    continue
+                score = (-sign*(a.x+b.x),sum(min(distance(r.pos,q) for r in self.turn.workers())
+                          for q in fleet) if self.turn.workers() else 0,a.x,a.y,b.x,b.y,rail.x,rail.y)
+                if best is None or score < best[0]:
+                    best = score,{a,b} if kind=='rocket' else {rail}
+        return best[1] if best else set()
+
     def construction_accessible(self, target, tower=False):
         """Keep workers and distinct operating seats connected to the outside."""
         from collections import deque
         free = self.geo.free - self.build_targets
-        outside = set(ring(self.turn, 3)) & free
+        # Daytime connectivity goes through the designated open gate. Closed
+        # layouts instead retain internal operator/repair connectivity.
+        outside = (set(ring(self.turn, 3)) if self.day < 3 else
+                   {q for q in neighbours(self.memory.gate_pos) if self.base_distance(q)==1}
+                   if self.memory.gate_pos else set(ring(self.turn,1))) & free
         def reachable(cells):
             seen = outside & cells
             queue = deque(seen)
@@ -405,13 +564,16 @@ class Planner:
 
     def missing_walls(self):
         occupied = self.turn.occupied_cells() | self.reserved | self.build_targets
-        return [p for p in self.walls if p not in occupied]
+        return [p for p in self.walls if p not in occupied and p != self.memory.gate_pos]
 
     def build_wall(self, role, routes):
         missing = self.missing_walls()
         if not missing:
             return False
         stock = role.backpack.count('stone')
+        if self.day >= 3 and stock <= 1 and not self.gate_wall():
+            # Reserve a physical stone for the last daytime gate closure.
+            return self.fetch_stone(role,routes,2)
         batch = min(3, (len(missing)+1)//2)
         # 要求3: 第1天前 30 回合先全员采铁/铜赚钱, 之后再采石修墙(不提前耗在采石上)
         if self.memory.day == 1 and (self.turn.round_no - 1) % 130 + 1 <= DAY1_ORE_PHASE_ROUNDS:
@@ -592,6 +754,9 @@ class Planner:
         return ready
 
     def night(self):
+        if not self.night_work_mode():
+            self.combat_night()
+            return
         # Defense owns all available operators at night. No delivery trip may
         # remove a controller; cooldown/idle turns may use items in place only.
         self.economic.prepare()
@@ -648,3 +813,166 @@ class Planner:
         # 不能在外面干等一整夜 —— 把离塔的人送回武器塔旁
         self.return_home_when_idle()
         # (防守模式下的解除已在本回合开头完成, 这里不再重复)
+
+    def combat_night(self):
+        """Evaluate fire-only and repair-reserved alternatives before emitting actions."""
+        self.memory.prepositioned.clear()
+        roles = [r for r in self.turn.controllable() if str(r.unit_id) not in self.commands
+                 and r.unit_id not in self.engaged]
+        towers = list(self.turn.weapons())
+        context = combat.combat_context(self.turn)
+        delays = {t.unit_id:min((self.route(r).distance(t.pos) for r in roles),default=INF) for t in towers}
+        reachable = [t for t in towers if delays[t.unit_id] < INF]
+        feasible = combat.estimate_clear_feasibility(self.turn,reachable,self.memory.rocket_hits,delays)
+        # Respect operator capacity when forecasting a depleted team.
+        if len(roles) < len(reachable) and feasible['remaining_effective_hp']:
+            feasible['clear_ratio'] *= len(roles)/max(1,len(reachable))
+        imminent = any(r['imminent'] for r in context['risks'].values())
+        pressure = any(r['incoming_this_round'] > 0 for r in context['risks'].values())
+        mode = self.memory.choose_combat_mode(self.turn,feasible['clear_ratio'],imminent,pressure)
+        context['mode'] = mode
+        repairs = [None]
+        for r in roles:
+            if 'WallFixer' not in r.backpack:
+                continue
+            for wall in self.turn.walls():
+                routes = self.route(r)
+                seats = [q for q in neighbours(wall.pos) if q in routes.cost
+                         and self.base_distance(q)<self.base_distance(wall.pos)]
+                stand = min(seats,key=lambda q:(routes.cost[q],q.x,q.y),default=None)
+                if stand is None:
+                    continue
+                eta = routes.cost[stand]
+                risk = combat.predict_wall_risk(self.turn,wall,repair_eta=eta+1,threats=context['threats'])
+                if combat.should_repair_wall(risk):
+                    repairs.append((r,wall,eta,stand))
+        cache = {}
+        rail = next((t for t in towers if t.kind=='railgun'),None)
+        rail_operator = min(roles,key=lambda r:(self.route(r).distance(rail.pos),
+            self.memory.tower_assignments.get(r.unit_id)==rail.unit_id and -1 or 0,r.unit_id),default=None) if rail else None
+        def fire(fleet):
+            key = tuple(t.unit_id for t in fleet)
+            if key not in cache:
+                cache[key] = combat.plan_fire(self.turn,fleet,context=context)
+            return cache[key]
+        best = None
+        for repair in repairs:
+            free = [r for r in roles if not repair or r.unit_id != repair[0].unit_id]
+            available = [t for t in towers if t.cooldown == 0]
+            for count in range(min(len(free),len(available))+1):
+                for fleet in combinations(available,count):
+                    bindings = [list(zip(chosen,fleet)) for chosen in permutations(free,count)
+                                if all(distance(r.pos,t.pos)==1 for r,t in zip(chosen,fleet))]
+                    if not bindings:
+                        continue
+                    binding = min(bindings,key=lambda pairs:(sum(r==rail_operator and t.kind!='railgun' for r,t in pairs),
+                                                            sum(self.memory.tower_assignments.get(r.unit_id,t.unit_id)!=t.unit_id
+                                                               for r,t in pairs),tuple(r.unit_id for r,t in pairs)))
+                    plan,residual = fire(fleet)
+                    # A second ready rocket needs a kill-threshold reason to fire.
+                    rockets = [t for t in fleet if t.kind=='rocket' and t.unit_id in plan]
+                    if len(rockets)==2:
+                        alternatives = [fire(tuple(t for t in fleet if t.unit_id!=rocket.unit_id))[0] for rocket in rockets]
+                        single = max(alternatives,key=lambda p:combat.score_plan(self.turn,fleet,p,context))
+                        if not combat.rocket_sync_value(self.turn,fleet,single,plan,context):
+                            continue
+                    risks = {u.unit_id:combat.predict_wall_risk(self.turn,u,residual,threats=context['threats'])
+                             for u in (*self.turn.walls(),self.turn.station()) if u is not None}
+                    if repair:
+                        r,wall,eta,stand = repair
+                        risk = combat.predict_wall_risk(self.turn,wall,residual,eta+1,context['threats'])
+                        if not combat.should_repair_wall(risk):
+                            continue
+                        if eta == 0:
+                            risk = risk.copy()
+                            full_hp = (1000,1500,2000)[max(1,min(3,wall.level))-1]
+                            risk['imminent'] = full_hp <= risk['damage_before_repair'] + combat.safety_margin(risk['damage_before_repair'])
+                        risks[wall.unit_id] = risk
+                    base_risk = risks.get(self.turn.station().unit_id,{})
+                    key = (-int(base_risk.get('imminent',False)),
+                           -sum(r['imminent'] for r in risks.values()),
+                           int(repair is not None and repair[2]>0),
+                           combat.score_plan(self.turn,fleet,plan,context),
+                           -int(repair is not None), -(repair[2] if repair else 0))
+                    if best is None or key > best[0]:
+                        best = key,binding,plan,residual,repair
+        used = set()
+        if best:
+            _,binding,plan,residual,repair = best
+            if repair:
+                r,wall,eta,stand = repair
+                # Repair stands stay inside the defensive perimeter at night.
+                routes = self.route(r)
+                if stand == r.pos:
+                    self.commands[str(r.unit_id)] = {'action':'use','name':'WallFixer','targetPos':[wall.pos.dump()]}
+                else:
+                    self.move(r,routes,stand)
+                used.add(r.unit_id)
+            for r,t in binding:
+                if t.unit_id not in plan:
+                    continue
+                self.commands[str(t.unit_id)] = {'action':'attack','controllerId':str(r.unit_id),
+                                                 'targetPos':[p.dump() for p in plan[t.unit_id]]}
+                used.add(r.unit_id)
+                self.memory.tower_assignments[r.unit_id] = t.unit_id
+                if t.kind == 'rocket':
+                    # Explicitly predicted per-missile effective hits, not attributed observations.
+                    total = sum(sum(min(x.health,combat.raw_damage(self.turn,t,p).get(x.robot_id,0))
+                                    for x in self.turn.robots if combat.our_target(self.turn,x)) for p in plan[t.unit_id])
+                    self.memory.rocket_hits.append(total/len(plan[t.unit_id]))
+                    self.memory.rocket_hits[:] = self.memory.rocket_hits[-combat.HIT_HISTORY_SIZE:]
+        # Free roles can use adjacent upgrades without displacing an active gun.
+        serviced = {best[4][1].unit_id} if best and best[4] else set()
+        for r in roles:
+            if r.unit_id in used:
+                continue
+            if self.economic.use_consumable(r):
+                used.add(r.unit_id)
+                continue
+            options = [o for o in self.economic.held_options(r) if o[3]!='WallFixer'
+                       and o[2] not in serviced and distance(r.pos,o[4].pos)==1]
+            if options:
+                _,_,uid,item,target = min(options,key=lambda o:o[:3])
+                self.commands[str(r.unit_id)] = {'action':'use','name':item,'targetPos':[target.pos.dump()]}
+                serviced.add(uid); used.add(r.unit_id)
+        self.combat_posts(roles,towers,used)
+
+    def combat_posts(self, roles, towers, used):
+        """One stable rocket-family seat, a rail seat, then an optional spare."""
+        free = [r for r in roles if r.unit_id not in used and str(r.unit_id) not in self.commands]
+        rockets = [t for t in towers if t.kind=='rocket']
+        rail = [t for t in towers if t.kind!='rocket']
+        operated = {c.get('controllerId') for c in self.commands.values() if c.get('action')=='attack'}
+        active = {int(uid) for uid,c in self.commands.items() if c.get('action')=='attack'}
+        targets = [t for t in rail if t.unit_id not in active]
+        if rockets and not any(t.unit_id in active for t in rockets):
+            targets += [min(rockets,key=lambda t:(t.cooldown,t.unit_id))]
+        if not targets and free and rockets:
+            targets = [min(rockets,key=lambda t:(t.cooldown,t.unit_id))]
+        for t in targets:
+            if not free:
+                break
+            r = min(free,key=lambda r:(self.route(r).distance(t.pos),
+                        self.memory.tower_assignments.get(r.unit_id,t.unit_id)!=t.unit_id,r.unit_id))
+            routes = self.route(r)
+            seats = [q for q in neighbours(t.pos) if q in routes.cost and self.base_distance(q)<=1]
+            if not seats:  # Legacy layouts outside the official inner ring.
+                seats = [q for q in neighbours(t.pos) if q in routes.cost]
+            shared = [q for q in seats if t.kind=='rocket' and all(distance(q,x.pos)==1 for x in rockets)]
+            chosen = shared or seats
+            stand = min(chosen,key=lambda q:(routes.cost[q],q.x,q.y),default=None)
+            if stand is not None:
+                self.move(r,routes,stand)
+                self.reserved.add(stand)
+                self.memory.tower_assignments[r.unit_id] = t.unit_id
+                free.remove(r)
+        for r in free:
+            # An unassigned repair/spare role still returns to shelter. It is
+            # not bound to a cooling tower and remains free for repair next turn.
+            routes = self.route(r)
+            seats = {q for t in towers for q in neighbours(t.pos)
+                     if q in routes.cost and self.base_distance(q)<=1 and q not in self.reserved}
+            stand = min(seats,key=lambda q:(routes.cost[q],q.x,q.y),default=None)
+            if stand is not None:
+                self.move(r,routes,stand)
+                self.reserved.add(stand)

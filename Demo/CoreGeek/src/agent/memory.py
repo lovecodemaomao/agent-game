@@ -9,6 +9,20 @@ WALL_PRESSURE_RATIO = 0.8      # 用户口径: 前夜围墙承伤超过该比例
 
 @dataclass
 class Memory:
+    combat_mode: str = 'KILL_ALL'
+    combat_day: int = 0
+    combat_check_round: int = 0
+    clear_fail_rounds: int = 0
+    combat_switch_round: int | None = None
+    rocket_hits: list = field(default_factory=list)
+    gate_pos: object = None
+    gate_state: str = 'open'
+    gate_keeper: int | None = None
+    wall_rebuilds: dict = field(default_factory=dict)
+    defense_breached: bool = False
+    night_breach: bool = False
+    night_station_hit: bool = False
+    previous_station_hp: int | None = None
     round_no: int = 0
     day: int = 0
     llm_used: int = 0
@@ -65,9 +79,45 @@ class Memory:
         self.trace.append(text)
         self.trace[:] = self.trace[-30:]
 
+    def choose_combat_mode(self, turn, clear_ratio, imminent, pressure=False):
+        from .fire_control import KILL_ALL_MODE, SURVIVAL_MODE, CLEAR_SAFE_RATIO, CLEAR_FAIL_RATIO
+        day = (turn.round_no-1)//130+1
+        if self.combat_day != day:
+            self.combat_day = day
+            self.combat_mode = KILL_ALL_MODE
+            self.clear_fail_rounds = 0
+            self.combat_check_round = 0
+            self.combat_switch_round = None
+            self.rocket_hits.clear()
+        if self.combat_check_round == turn.round_no:
+            return self.combat_mode
+        consecutive = self.combat_check_round == turn.round_no-1
+        self.combat_check_round = turn.round_no
+        self.clear_fail_rounds = (self.clear_fail_rounds if consecutive else 0)+1 if clear_ratio < CLEAR_FAIL_RATIO else 0
+        if self.combat_mode != SURVIVAL_MODE and (imminent or self.clear_fail_rounds >= 2
+                or (clear_ratio < CLEAR_SAFE_RATIO and pressure)):
+            self.combat_mode = SURVIVAL_MODE
+            self.combat_switch_round = turn.round_no
+            self.event(f'combat -> SURVIVAL: clear_ratio={clear_ratio:.2f}, imminent={imminent}')
+        return self.combat_mode
+
     def observe(self, turn, payload):
         day = (turn.round_no - 1)//130 + 1
         if self.day != day:
+            # The first dawn observation includes the final night's settlement.
+            if self.round_no and (self.round_no-1)%130 >= 70:
+                alive_walls = {w.unit_id for w in turn.walls()}
+                self.night_breach |= bool(set(self.wall_hp)-alive_walls)
+                base = turn.station()
+                self.night_station_hit |= (base is not None and self.previous_station_hp is not None
+                                            and base.health < self.previous_station_hp)
+            self.defense_breached = self.night_breach and self.night_station_hit
+            self.night_breach = self.night_station_hit = False
+            self.combat_day = day
+            self.combat_mode = 'KILL_ALL'
+            self.combat_check_round = self.clear_fail_rounds = 0
+            self.combat_switch_round = None
+            self.rocket_hits.clear()
             self.day = day
             self.llm_used = 0
             self.news_attempts = 0
@@ -95,8 +145,8 @@ class Memory:
         # 需求4: 夜战状态锁 —— 用连续回合数去抖, 避免机器人贴着威胁半径来回时
         # "出工/回塔"每回合翻转(实测会让工人在矿与塔之间来回踱步、既不采矿也不防守)
         if not turn.is_day:
-            from .geography import battle_over
-            if battle_over(turn):
+            from .fire_control import our_target
+            if not any(r.health > 0 and our_target(turn,r) for r in turn.robots):
                 self.night_calm += 1
                 self.night_hot = 0
             else:
@@ -104,12 +154,16 @@ class Memory:
                 self.night_calm = 0
             if self.night_calm >= NIGHT_MODE_CALM_ROUNDS:
                 self.night_mode = 'work'
-            elif self.night_hot >= NIGHT_MODE_HOT_ROUNDS:
+            elif self.night_hot:
                 self.night_mode = 'defend'
         # 需求6: 累计夜间围墙承伤(掉血 + 被打掉时的剩余血量); 白天我方 remove/重建不计
         self._track_wall_damage(turn)
         # 基地受伤是永久状态: 只要掉过血就一直记着, 用来触发基地升级券
         station = turn.station()
+        if station is not None:
+            if not turn.is_day and self.previous_station_hp is not None and station.health < self.previous_station_hp:
+                self.night_station_hit = True
+            self.previous_station_hp = station.health
         if station is not None and station.health > 0:
             from .economy import HP
             level = max(1, min(3, station.level))
@@ -236,6 +290,7 @@ class Memory:
             if uid not in seen:
                 # 夜里消失 = 被机器人打掉: 剩余血量计入承伤
                 self.night_wall_damage += health
+                self.night_breach = True
 
     def remember(self, turn, response):
         self.last_commands = response['roleCommandMap'].copy()

@@ -244,7 +244,8 @@ class UpgradeOrderTests(unittest.TestCase):
             planner = Planner(Turn.load(p), p, m)
             options = planner.economic.options()
             # 三级墙已满级，保命手段是 WallFixer（修复包），应排在首位
-            self.assertEqual(options[0][3], 'WallFixer', [o[3] for o in options])
+            self.assertIn('WallFixer', [o[3] for o in options])
+            self.assertTrue(options[0][3].startswith('Weapon'))  # daytime: no immediate attack
 
 
 if __name__ == '__main__':

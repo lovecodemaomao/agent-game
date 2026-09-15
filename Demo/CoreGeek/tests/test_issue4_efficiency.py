@@ -59,7 +59,7 @@ class RingFirstTests(unittest.TestCase):
         self.assertTrue(any(fetched), '半圈未完成时工人应去采石/建墙')
 
     def test_after_ring_complete_both_mine_ore(self):
-        sites = wall_sites(Turn.load(payload()))
+        sites = wall_sites(Turn.load(payload(day=2)))
         if not sites:
             self.skipTest('no wall sites')
         p = payload(day=2, gold=75, walls=[unit(40 + i, 'wall', q.x, q.y, health=1000)
@@ -124,7 +124,7 @@ class BatchTests(unittest.TestCase):
 
 class StationFallbackTests(unittest.TestCase):
     def test_day4_low_hp_station_is_top_priority(self):
-        p = payload(day=STATION_FALLBACK_DAY, gold=200, station_health=STATION_FALLBACK_HP - 100)
+        p = payload(day=STATION_FALLBACK_DAY, gold=200, station_health=800)
         m = Memory(day=STATION_FALLBACK_DAY)
         planner = Planner(Turn.load(p), p, m)
         options = planner.economic.options()
@@ -132,7 +132,7 @@ class StationFallbackTests(unittest.TestCase):
 
     def test_day3_damaged_station_is_top_priority(self):
         # 需求3: 第3天之后基地一受伤, 当天第一优先级就是基地升级券
-        p = payload(day=STATION_URGENT_DAY, gold=200, station_health=900)
+        p = payload(day=STATION_URGENT_DAY, gold=200, station_health=800)
         m = Memory(day=STATION_URGENT_DAY)
         planner = Planner(Turn.load(p), p, m)
         options = planner.economic.options()
@@ -142,27 +142,27 @@ class StationFallbackTests(unittest.TestCase):
         p = payload(day=STATION_URGENT_DAY, gold=1000, station_health=1400)
         m = Memory(day=STATION_URGENT_DAY)
         planner = Planner(Turn.load(p), p, m)
-        self.assertEqual(planner.economic.options()[0][3], 'StationUpgradeVoucher1')
+        self.assertEqual(planner.economic.options()[0][3], 'WeaponUpgradeVoucher1')
 
     def test_before_day3_low_hp_station_is_not_special(self):
         # 第3天之前即使基地掉血也不抢武器/围墙升级的优先级
-        p = payload(day=2, gold=200, station_health=STATION_FALLBACK_HP - 100)
+        p = payload(day=2, gold=200, station_health=800)
         m = Memory(day=2)
         planner = Planner(Turn.load(p), p, m)
         items = [o[3] for o in planner.economic.options()]
         self.assertIn('StationUpgradeVoucher1', items)
-        self.assertNotEqual(items[0], 'StationUpgradeVoucher1', items)
+        self.assertEqual(items[0], 'StationUpgradeVoucher1', items)  # critical HP is urgent on any day
 
     def test_tier2_voucher_when_day_starts_rich_and_station_is_level2(self):
         # 需求3: 白天开始时金币>150 且基地已 2 级 -> 直接买基地升级卷2
-        p = payload(day=STATION_URGENT_DAY, gold=200, station_health=2000)
+        p = payload(day=STATION_URGENT_DAY, gold=200, station_health=1700)
         p['teamOur']['roles'][0]['level'] = 2
         m = Memory(day=STATION_URGENT_DAY, day_start_gold=200)
         planner = Planner(Turn.load(p), p, m)
         self.assertEqual(planner.economic.options()[0][3], 'StationUpgradeVoucher2')
 
     def test_tier1_voucher_when_station_still_level1(self):
-        p = payload(day=STATION_URGENT_DAY, gold=200, station_health=900)
+        p = payload(day=STATION_URGENT_DAY, gold=200, station_health=800)
         m = Memory(day=STATION_URGENT_DAY, day_start_gold=200)
         planner = Planner(Turn.load(p), p, m)
         self.assertEqual(planner.economic.options()[0][3], 'StationUpgradeVoucher1')
@@ -288,24 +288,31 @@ class NightVoucherDeliveryTests(unittest.TestCase):
         self.assertEqual(cmd['name'], 'WallUpgradeVoucher1')
 
     def test_night_moves_to_inner_side_when_adjacent_outside(self):
-        # 贴墙但在外侧 -> 先绕到内侧再用(外侧会被机器人打)
+        # A legal detour need not strictly reduce geometric distance every step.
         sites = wall_sites(Turn.load(payload()))
         wall = sites[0]
-        station = Pos(10, 24)
-        outside = max((Pos(wall.x + dx, wall.y + dy)
-                       for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy),
-                      key=lambda q: distance(q, station))
-        p = payload(day=1, gold=0, walls=[unit(40, 'wall', wall.x, wall.y, health=1000)])
+        p = payload(day=1, gold=0, walls=[unit(40,'wall',wall.x,wall.y,health=1000)])
         p['roundNo'] = 85
-        p['teamOur']['roles'][1]['pos'] = outside.dump()
+        p['teamOur']['roles'][1]['pos'] = {'x':wall.x+1,'y':wall.y}
         p['teamOur']['roles'][1]['backpack'] = ['WallUpgradeVoucher1']
+        p['robot']['roles'] = [unit(90,'bossRobot',20,24,health=800,targetTeam='challenger')]
         m = Memory(day=1)
-        planner = Planner(Turn.load(p), p, m)
-        planner.run()
-        cmd = planner.commands.get('2')
-        self.assertEqual(cmd['action'], 'move', cmd)
-        tgt = Pos.load(cmd['targetPos'][0])
-        self.assertLess(distance(tgt, station), distance(outside, station), '应走向更靠基地的一侧')
+        for _ in range(12):
+            turn = Turn.load(p)
+            commands = decide_response(p,m)['roleCommandMap']
+            for role in p['teamOur']['roles']:
+                cmd = commands.get(str(role['id']))
+                if cmd and cmd['action']=='use':
+                    role['backpack'].remove(cmd['name'])
+                    target=next(u for u in p['teamOur']['roles'] if u['pos']==cmd['targetPos'][0])
+                    target['level']+=1
+                if cmd and cmd['action']=='move':
+                    target = Pos.load(cmd['targetPos'][0])
+                    self.assertNotIn(target,turn.occupied_cells())
+                    role['pos'] = target.dump()
+            p['roundNo'] += 1
+        worker = next(r for r in Turn.load(p).workers() if r.unit_id==2)
+        self.assertLessEqual(min(distance(worker.pos,t.pos) for t in Turn.load(p).weapons()),1)
 
     def test_night_returns_to_tower_instead_of_delivering_wall_voucher(self):
         # 夜间先保证炮位，不为墙券离开防御位置。

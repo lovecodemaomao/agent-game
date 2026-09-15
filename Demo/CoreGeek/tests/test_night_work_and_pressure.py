@@ -276,7 +276,7 @@ class WallPressureTests(unittest.TestCase):
     def test_damaged_station_still_outranks_everything(self):
         sites = wall_sites(Turn.load(build_payload(day=3)))
         walls = [unit(40, 'wall', sites[0].x, sites[0].y, health=1000)]
-        p = build_payload(day=3, walls=walls, rod=1, station_health=900)
+        p = build_payload(day=3, walls=walls, rod=1, station_health=800)
         m = Memory(day=3)
         m.wall_pressure_high = True
         planner = Planner(Turn.load(p), p, m)

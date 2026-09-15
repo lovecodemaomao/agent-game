@@ -2,6 +2,12 @@
 from collections import Counter
 from .geography import INF
 from .protocol import distance
+from . import fire_control as combat
+
+STATION_CRITICAL_RATIO = .60
+STATION_MODERATE_RATIO = .80
+HEAVY_HP_RATIO = .50
+L1_REBUILD_RATIO = .50
 
 ORES=('stone','iron','copper')
 SELLABLE=('iron','copper')                 # 需求5: 石头不卖, 只用于建墙/修墙(重建)
@@ -63,18 +69,21 @@ class Economy:
         return out
 
     def station_urgent(self):
-        """需求3: 第3天之后只要基地受过伤, 当天第一优先级就是买基地升级券。
+        station = self.turn.station()
+        if station is None or station.level >= 3 or station.health <= 0:
+            return False
+        ratio = station.health / HP['station'][max(1,station.level)-1]
+        return ratio < STATION_CRITICAL_RATIO or self.m.defense_breached
 
-        档位(用户给定): 当天白天开始时金币>150 且基地已 2 级 -> 买基地升级卷2,
-        否则买当前等级的基地升级卷1; 券在夜晚回家时使用。
-        """
-        station=self.turn.station()
-        if station is None or station.health<=0: return False
-        level=max(1,min(3,station.level))
-        if level>=3: return False
-        day=self.m.day or ((self.turn.round_no-1)//130+1)
-        if day<STATION_URGENT_DAY: return False
-        return bool(self.m.station_hit) or station.health<HP['station'][level-1]
+    def weapon_priority(self, weapon):
+        # All three L2 before any L3; large/boss pressure may advance the rail.
+        level = max(1, weapon.level)
+        targets = [r for r in self.turn.robots if r.health > 0 and combat.our_target(self.turn,r)]
+        heavy = sum(r.health for r in targets if r.kind in ('largeRobot','bossRobot'))
+        rail_first = bool(targets) and heavy >= sum(r.health for r in targets)*HEAVY_HP_RATIO
+        if level == 1:
+            return .5 if weapon.kind == 'rocket' else .8
+        return 1.0 if weapon.kind == ('railgun' if rail_first else 'rocket') else 1.2
 
     def station_tier(self):
         """基地升级券档位: 白天开始时金币>150 且已 2 级 -> 2 级券, 其余买当前等级。"""
@@ -127,59 +136,85 @@ class Economy:
         return done < max(1,len(walls)//2)
 
     def options(self):
-        """已有修复包和危急建筑优先，其次武器、围墙和常规基地升级。"""
-        options=[]
-        wall_quota=self.wall_quota_left()>0
-        held_fixer=any('WallFixer' in r.backpack for r in self.turn.controllable())
+        options = []
         for u in (*self.turn.weapons(), *self.turn.walls(), self.turn.station()):
-            if u is None: continue
-            level=max(1,min(3,u.level)); ratio=u.health/HP[u.kind][level-1]
-            front = u.kind=='wall' and u.pos in self.p.walls
-            # 主动防御修复: 面向机器人的前排墙血量<70% 即修(不等被打爆), 其余墙<50% 才修;
-            # 手上已有修复包 -> 最高优先级(不花金币); 需现买则排在武器/围墙升级之后。
-            if u.kind=='wall' and ratio < self.repair_threshold(u) \
-                    and (level>=3 or held_fixer):
-                # 手上没修复包时按严重度: 濒临被打爆(<25%)优先于武器升级, 否则排在升级之后
-                item='WallFixer'
-                priority = 0 if held_fixer else (0.3 if ratio<CRITICAL_REPAIR_RATIO else 2.6)
-            elif u.kind=='wall' and level==3:
-                if ratio>=self.repair_threshold(u): continue
-                item='WallFixer'; priority=4 if held_fixer else 4.5
-            elif (u.kind=='station' and level<3
-                  and ((ratio<0.6) or self.station_urgent())):
-                # 需求3: 第3天之后基地一受伤, 当天第一优先级就是基地升级券
-                item=f'StationUpgradeVoucher{self.station_tier()}'; priority=0
-            else:
-                if level>=3: continue
-                prefix='Station' if u.kind=='station' else 'Wall' if u.kind=='wall' else 'Weapon'
-                item=f'{prefix}UpgradeVoucher{level}'
-                wall_first = self.wall_voucher_first()
-                if u.kind=='rocket':
-                    # 第1天武器券先行(当天要完成2个武器升级); 第2天起/围墙吃紧时让位给围墙券
-                    priority = (1.2 if level==1 else 1.3) if wall_first else (0.5 if level==1 else 0.6)
-                elif u.kind in ('railgun','gatling'):
-                    priority = (1.2 if level==1 else 1.3) if wall_first else (0.8 if level==1 else 0.9)
-                elif u.kind=='wall':
-                    # 优先买围墙升级券: 墙配额未完成时排在武器券之前
-                    priority = (0.9 if level==1 else 1.0) if wall_first \
-                        else (2.0 if level==1 else 2.4)
-                else:                      # station 常规升级(未到濒危/兜底条件)
-                    priority = 2.2 if level==1 else 2.6
-            # 围墙: 越朝向机器人越优先（self.p.walls 已按迎敌方向由前到后排序），
-            # 非迎敌半圈的墙排到最后；受损墙再略微提前（ratio 越小越靠前）。
-            if u.kind=='wall':
-                if u.pos in self.p.walls:
-                    priority += self.p.walls.index(u.pos)*0.05 + ratio*0.1
+            if u is None or u.health <= 0:
+                continue
+            level = max(1,min(3,u.level))
+            ratio = u.health / HP[u.kind][level-1]
+            if u.kind == 'wall':
+                if u.pos == self.m.gate_pos:
+                    continue
+                group = self.p.wall_group(u.pos)
+                if level < 3:
+                    # Group first, then level: a complete front tier before side/back.
+                    priority = (0.9 if self.wall_voucher_first() else 2.0) + group*2 + (level-1)*.4
+                    item = f'WallUpgradeVoucher{level}'
+                elif ratio < self.repair_threshold(u):
+                    item = 'WallFixer'; priority = 3.0+group
                 else:
-                    priority += 2 + ratio*0.1
+                    continue
+            elif u.kind == 'station':
+                if level >= 3:
+                    continue
+                item = f'StationUpgradeVoucher{level}'
+                priority = 0 if self.station_urgent() else 1.4 if ratio < STATION_MODERATE_RATIO else 6
+            else:
+                if level >= 3:
+                    continue
+                item = f'WeaponUpgradeVoucher{level}'
+                priority = self.weapon_priority(u) + (1 if self.wall_voucher_first() else 0)
             options.append((priority,level,u.unit_id,item,u))
         return sorted(options,key=lambda x:x[:3])
+
+    def maintain_wall(self, role, routes):
+        if not self.turn.is_day:
+            return False
+        rod = (self.turn.round_no-1)%130+1
+        # Finish a previously observed demolition before taking any other job.
+        pending = self.m.wall_rebuilds.get(role.unit_id)
+        if pending is not None:
+            if any(w.pos == pending for w in self.turn.walls()):
+                wall = next(w for w in self.turn.walls() if w.pos == pending)
+                if wall.health >= HP['wall'][max(1,wall.level)-1] or wall.level > 1:
+                    self.m.wall_rebuilds.pop(role.unit_id,None)
+                    return False
+                # Failed remove: keep the same transaction, never assume success.
+                if rod < 69 and 'stone' in role.backpack:
+                    return self.p.interact(role,routes,pending,'remove',targetPos=[pending.dump()])
+                return False
+            if 'stone' in role.backpack and rod <= 70 and pending not in self.p.build_targets:
+                if self.p.interact(role,routes,pending,'build',name='wall',targetPos=[pending.dump()]):
+                    self.p.build_targets.add(pending)
+                    return True
+            return False
+        occupied = set(self.m.wall_rebuilds.values())
+        for wall in sorted(self.turn.walls(),key=lambda w:(self.p.wall_group(w.pos),w.health,w.unit_id)):
+            if wall.level != 1 or wall.health >= HP['wall'][0]*L1_REBUILD_RATIO or wall.pos in occupied:
+                continue
+            if wall.pos == self.m.gate_pos:
+                continue
+            voucher = 'WallUpgradeVoucher1'
+            delivery = any(j.get('unit')==wall.unit_id and j.get('item')==voucher
+                           and j.get('bought') for j in self.m.jobs.values())
+            if voucher in role.backpack or delivery:
+                continue
+            reserve = int(self.p.day>=3 and not self.p.gate_wall())
+            if role.backpack.count('stone') <= reserve or routes.distance(wall.pos)+2 > 70-rod:
+                continue
+            if self.p.interact(role,routes,wall.pos,'remove',targetPos=[wall.pos.dump()]):
+                self.m.wall_rebuilds[role.unit_id] = wall.pos
+                return True
+        return False
 
     def target(self,job):
         return next((u for u in self.turn.ours if u.unit_id==job.get('unit') and u.health>0),None)
 
     def usable(self,job,target):
         if target is None: return False
+        if target.kind=='wall' and target.pos==self.m.gate_pos: return False
+        if job['item']=='WallFixer' and not self.turn.is_day:
+            return combat.should_repair_wall(combat.predict_wall_risk(self.turn,target))
         if job['item']=='WallFixer': return target.health<HP['wall'][max(1,target.level)-1]
         return target.level==job['level']
 
@@ -188,6 +223,7 @@ class Economy:
         result=[]
         for target in self.turn.ours:
             if target.health<=0 or target.kind not in HP: continue
+            if target.kind=='wall' and target.pos==self.m.gate_pos: continue
             level=max(1,min(3,target.level))
             prefix=('Station' if target.kind=='station' else
                     'Wall' if target.kind=='wall' else 'Weapon')
@@ -195,7 +231,8 @@ class Economy:
             if level<3 and voucher in role.backpack:
                 result.append((0,level,target.unit_id,voucher,target))
             if (target.kind=='wall' and 'WallFixer' in role.backpack
-                    and target in self.damaged_walls()):
+                    and ((not self.turn.is_day and combat.should_repair_wall(combat.predict_wall_risk(self.turn,target)))
+                         or (self.turn.is_day and level>=2 and target in self.damaged_walls()))):
                 result.append((1,level,target.unit_id,'WallFixer',target))
         return result
 
@@ -224,6 +261,7 @@ class Economy:
             kinds={'Weapon':('rocket','railgun','gatling'),'Wall':('wall',),'Station':('station',)}
             targets=sum(u.health>0 and u.kind in kinds.get(prefix,()) and u.level==int(level)
                         and u.unit_id not in assigned
+                        and not (u.kind=='wall' and u.pos==self.m.gate_pos)
                         and not (prefix=='Wall' and int(level)==1 and u.health<=0)
                         for u in self.turn.ours)
             held=sum(r.backpack.count(item) for r in self.turn.controllable())
@@ -311,7 +349,7 @@ class Economy:
             # 第一天: 围墙是"用石头现场建"的，不得用采购额度抢武器升级的预算；
             # 武器升级券与保命项照常允许（需求3: 武器升级尽量在第一天完成）。
             day=self.m.day or ((self.turn.round_no-1)//130+1)
-            if day==1 and self.p.missing_walls() and not item.startswith('Weapon'):
+            if day==1 and self.p.missing_walls() and not item.startswith('Weapon') and not (item.startswith('Station') and self.station_urgent()):
                 continue
             choices=[]
             for role in self.turn.workers():

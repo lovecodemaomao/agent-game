@@ -144,18 +144,12 @@ class WallExtensionTests(unittest.TestCase):
         self.assertEqual(len(wall_sites(Turn.load(build_payload(day=2)))), 10)
 
     def test_day3_extends_to_twelve_cells(self):
-        turn = Turn.load(build_payload(day=3))
-        base = wall_sites(turn)
-        extended = wall_sites(turn, extend=1)
-        self.assertEqual(len(extended), 12)
-        extra = [p for p in extended if p not in base]
-        self.assertEqual(len(extra), 2)
-        for pos in extra:
-            self.assertIn(pos, ring(turn, 2), '新增格必须仍在围墙环上')
-            self.assertTrue(any(distance(pos, q) <= 2 for q in base), '新增格应接在墙的两端')
+        turn=Turn.load(build_payload(day=3))
+        self.assertEqual(set(wall_sites(turn)),set(ring(turn,2)))
+        self.assertEqual(len(wall_sites(turn)),20)
 
     def test_planner_uses_twelve_walls_from_day3(self):
-        for day, expected in ((2, 10), (3, 12), (4, 12)):
+        for day, expected in ((2, 10), (3, 20), (4, 20)):
             p = build_payload(day=day)
             planner = Planner(Turn.load(p), p, Memory(day=day))
             self.assertEqual(len(planner.walls), expected, f'day {day}')
@@ -164,7 +158,7 @@ class WallExtensionTests(unittest.TestCase):
         # 第3天缺的墙(含两端的加长格)要被列入待建清单
         p = build_payload(day=3)
         planner = Planner(Turn.load(p), p, Memory(day=3))
-        self.assertEqual(len(planner.missing_walls()), 12)
+        self.assertEqual(len(planner.missing_walls()), 19)
 
 
 class WallMaintenanceTests(unittest.TestCase):
@@ -335,33 +329,14 @@ class NightPrepositionTests(unittest.TestCase):
                          '预置站位必须是矿点的采集邻格')
 
     def test_robot_at_the_threat_radius_edge_does_not_cause_pacing(self):
-        """回归: 机器人在威胁半径边缘来回时, 工人不能一会儿出工一会儿回塔。
-
-        以前"夜战结束"是逐回合瞬时判定: 机器人 11 格(判清场) / 9 格(判交战)交替时,
-        工人每回合被 出工<->回塔 来回推翻, 在矿与塔之间踱步却采不到矿。
-        现在用连续回合去抖的状态锁: 单回合的翻转不改变当前模式。
-        """
-        p = self.night_payload(rod=100, robots=[robot(1, 24, 24)])   # 先处于清场
-        m = Memory(day=3)
-        decide_response(p, m)
-        p['roundNo'] += 1
-        decide_response(p, m)
-        p['roundNo'] += 1
-        self.assertTrue(Planner(Turn.load(p), p, m).night_work_mode())
-        trail = []
-        for rb in (robot(1, 19, 24), robot(1, 24, 24), robot(1, 19, 24), robot(1, 24, 24)):
-            p['robot'] = {'roles': [rb]}
-            response = decide_response(p, m)
-            worker = next(r for r in p['teamOur']['roles'] if r['id'] == 2)
-            command = response['roleCommandMap'].get('2')
-            trail.append((worker['pos']['x'], worker['pos']['y']))
-            if command and command['action'] == 'move':
-                worker['pos'] = command['targetPos'][0]
-            p['roundNo'] += 1
-        mines = [Pos(6, 24), Pos(6, 22)]
-        spans = [min(distance(Pos(*q), mine) for mine in mines) for q in trail]
-        self.assertEqual(spans, sorted(spans, reverse=True),
-                         f'半径边缘的机器人不应带着工人折返, 实际轨迹 {trail}')
+        # Distance changes cannot release operators while any own-wave robot survives.
+        p=self.night_payload(rod=100,robots=[robot(1,24,24)])
+        m=Memory(day=3)
+        for x in (24,19,24,19,24):
+            p['robot']['roles']=[robot(1,x,24)]
+            decide_response(p,m)
+            self.assertFalse(Planner(Turn.load(p),p,m).night_work_mode())
+            p['roundNo']+=1
 
     def test_idle_worker_returns_home_at_night_instead_of_staying_out(self):
         """回归: 夜里进入开工状态但没活可干(无矿可采)时, 工人必须回武器塔旁。
@@ -414,20 +389,16 @@ class NightPrepositionTests(unittest.TestCase):
         self.assertFalse(planner.night_battle_over())
 
     def test_distant_wandering_robot_does_not_block_night_actions(self):
-        # 阵前已清空(只剩远处游走的机器人) -> 连续清空 2 回合后进入开工状态, 不再干等到夜末
-        p = self.night_payload(rod=100, robots=[robot(9, 38, 2)])
-        m = Memory(day=1)
-        first = Planner(Turn.load(p), p, m)
-        self.assertTrue(first.night_battle_over(), '远处机器人不算阵前威胁')
-        self.assertFalse(first.night_work_mode(), '第一回合先按防守(去抖), 不立刻出工')
-        decide_response(p, m)                     # 第 1 个清空回合
-        p['roundNo'] += 1
-        decide_response(p, m)                     # 第 2 个清空回合 -> 进入开工状态
-        p['roundNo'] += 1
-        third = Planner(Turn.load(p), p, m)
-        self.assertTrue(third.night_work_mode(), '连续清空 2 回合后进入开工状态')
-        worker = [w for w in third.turn.workers() if w.unit_id == 2][0]
-        self.assertTrue(third.preposition(worker), '进入开工状态后应当去下一天岗位')
+        # Explicit opponent waves do not delay our work; own stragglers do.
+        p=self.night_payload(rod=100,robots=[robot(9,38,2)])
+        p['robot']['roles'][0]['targetTeam']='defender'
+        m=Memory(day=3)
+        for _ in range(2):
+            decide_response(p,m); p['roundNo']+=1
+        self.assertTrue(Planner(Turn.load(p),p,m).night_work_mode())
+        p['robot']['roles'][0]['targetTeam']='challenger'
+        decide_response(p,m)
+        self.assertFalse(Planner(Turn.load(p),p,m).night_work_mode())
 
     def test_robot_inside_threat_radius_keeps_everyone_on_defense(self):
         p = self.night_payload(rod=100, robots=[robot(1, 12, 25)])
