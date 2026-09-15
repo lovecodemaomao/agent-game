@@ -114,17 +114,17 @@ wk.backpack = ["stone"]
 step1(w, res, ch={"10010": {"action": "build", "name": "wall", "targetPos": [{"x": 6, "y": 21}]}})
 walls = [u for u in w.units.values() if u.role_type == "wall" and u.team == "challenger"]
 assert any(x.pos == {"x": 6, "y": 21} for x in walls) and wk.backpack == []
-# 白天不能attack已在校验器测过；蓝区建武器
+# 白天不能attack已在校验器测过；蓝区建武器（官方demo口径: 距基地1）
 wk2 = w.units[10012]
-wk2.pos = {"x": 9, "y": 27}
+wk2.pos = {"x": 9, "y": 23}   # 距新footprint(左上角向右下) 目标(9,22)的相邻格
 g0 = w.teams["challenger"].gold
-step1(w, res, ch={"10012": {"action": "build", "name": "gatling", "targetPos": [{"x": 10, "y": 27}]}})
-new_w = [u for u in w.units.values() if u.role_type == "gatling" and u.team == "challenger" and u.pos == {"x": 10, "y": 27}]
+step1(w, res, ch={"10012": {"action": "build", "name": "gatling", "targetPos": [{"x": 9, "y": 22}]}})
+new_w = [u for u in w.units.values() if u.role_type == "gatling" and u.team == "challenger" and u.pos == {"x": 9, "y": 22}]
 assert new_w and w.teams["challenger"].gold == g0 - 25
-# 武器上限：已有3座(初始)再建失败
-wk2.pos = {"x": 10, "y": 28}
-step1(w, res, ch={"10012": {"action": "build", "name": "rocket", "targetPos": [{"x": 10, "y": 28}]}})
-assert not [u for u in w.units.values() if u.role_type == "rocket" and u.team == "challenger" and u.pos == {"x": 10, "y": 28}]
+# 蓝区外建武器失败（距基地2在蓝区[1,1]之外）
+wk2.pos = {"x": 9, "y": 21}
+step1(w, res, ch={"10012": {"action": "build", "name": "rocket", "targetPos": [{"x": 8, "y": 21}]}})
+assert not [u for u in w.units.values() if u.role_type == "rocket" and u.team == "challenger" and u.pos == {"x": 8, "y": 21}]
 # 升级回满血
 wall = walls[0]
 wall.hp = 500

@@ -204,10 +204,13 @@ class WorldState:
         return [u for u in self.units.values() if u.team == team and u.role_type == "station" and u.alive]
 
     def cells_of(self, u: Unit) -> List[Tuple[int, int]]:
-        """单位占据的格子（基地2x2，其余1x1）。"""
+        """单位占据的格子（基地2x2，其余1x1）。
+
+        接口文档口径: 基地 pos 为左上角，向右下延伸（官方 demo station_footprint 同款）。
+        """
         if u.role_type == "station":
             x, y = u.pos["x"], u.pos["y"]
-            return [(x, y), (x + 1, y), (x, y + 1), (x + 1, y + 1)]
+            return [(x, y), (x + 1, y), (x, y - 1), (x + 1, y - 1)]
         return [(u.pos["x"], u.pos["y"])]
 
     def occupied(self, exclude: Optional[Set[int]] = None) -> Dict[Tuple[int, int], int]:
@@ -229,7 +232,7 @@ class WorldState:
             return 999
         b = bu[0]
         x0, y0 = b.pos["x"], b.pos["y"]
-        cells = [(x0, y0), (x0 + 1, y0), (x0, y0 + 1), (x0 + 1, y0 + 1)]
+        cells = [(x0, y0), (x0 + 1, y0), (x0, y0 - 1), (x0 + 1, y0 - 1)]  # 左上角向右下
         return min(max(abs(pos["x"] - cx), abs(pos["y"] - cy)) for cx, cy in cells)
 
     def _random_free_cell(self, rng: random.Random) -> Dict[str, int]:

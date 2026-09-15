@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, Optional
 
@@ -33,23 +34,19 @@ class LLMProxy:
         self.history: Dict[str, list] = {"challenger": [], "defender": []}
         self.quota: Dict[str, Dict] = {t: {"day": 0, "used": 0} for t in ("challenger", "defender")}
         self.errors: Dict[str, list] = {"challenger": [], "defender": []}
-        self._pending: Dict[str, Future] = {}
+        self._pending: Dict[str, Any] = {}  # team -> deque[Future]（FIFO，保序回填）
         self.stats = {t: {"total": 0, "quota_used": 0, "rejected": 0} for t in ("challenger", "defender")}
 
     # ------------------------------------------------------------------
     def on_round(self, round_no: int, round_recs: Dict[str, Any]) -> None:
+        """按《接口文档》语义回填 llmResp: 本回合的 prompt 在回合内调用 LLM，
+        下一回合 request.llmResp 返回其结果（同步等待，与真实判题器一致）。
+
+        早期实现用后台线程+队列异步回填：回合推进远快于 LLM 延迟时，
+        请求方收到的是"迟到的、非上一回合"的响应，破坏了接口文档约定的
+        1 回合延迟，使按 request_id 校验回复的 agent 永远匹配不上。
+        """
         day = R.day_of(round_no)
-        # 回收已完成的异步调用 -> 下回合回填
-        for team, fut in list(self._pending.items()):
-            if fut.done():
-                try:
-                    resp = fut.result()
-                except Exception as e:
-                    resp = f"[LLM_ERROR] {e}"
-                if self.provider is not None:
-                    self.provider.llm_resp[team] = resp
-                del self._pending[team]
-        # 处理本轮 prompt
         for team, rec in round_recs["teams"].items():
             prompt = (rec.get("response") or {}).get("prompt", "")
             if not prompt:
@@ -70,8 +67,12 @@ class LLMProxy:
                 q["used"] += 1
                 self.stats[team]["quota_used"] += 1
             self.stats[team]["total"] += 1
-            fut = self.executor.submit(self._call, team, prompt)
-            self._pending[team] = fut
+            try:
+                resp = self._call(team, prompt)
+            except Exception as e:
+                resp = f"[LLM_ERROR] {e}"
+            if self.provider is not None:
+                self.provider.llm_resp[team] = resp
 
     def errors_for(self, team: str):
         errs = self.errors[team]
