@@ -15,6 +15,7 @@ import time
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
+PACKAGE_DIR = 'CoreGeek'  # Platform starts /home/docker/CoreGeek/main3.py
 
 
 def build(destination):
@@ -30,12 +31,12 @@ def build(destination):
         with tarfile.open(fileobj=compressed, mode='w', format=tarfile.PAX_FORMAT) as archive:
             for name, path in sorted(files.items()):
                 data = path.read_bytes().replace(b'\r\n', b'\n')
-                info = tarfile.TarInfo(name)
+                info = tarfile.TarInfo(PACKAGE_DIR + '/' + name)
                 info.size, info.mode, info.mtime = len(data), 0o755 if name == 'run.sh' else 0o644, 0
                 archive.addfile(info, io.BytesIO(data))
                 manifest[name] = hashlib.sha256(data).hexdigest()
             data = (json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + '\n').encode()
-            info = tarfile.TarInfo('MANIFEST.sha256.json')
+            info = tarfile.TarInfo(PACKAGE_DIR + '/MANIFEST.sha256.json')
             info.size, info.mode = len(data), 0o644
             archive.addfile(info, io.BytesIO(data))
     digest = hashlib.sha256(destination.read_bytes()).hexdigest()
@@ -53,11 +54,15 @@ def verify(destination):
                     raise ValueError('Unexpected archive member: ' + member.name)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(archive.extractfile(member).read())
-                if member.name == 'run.sh':
+                assert member.name.startswith(PACKAGE_DIR + '/'), member.name
+                if member.name == PACKAGE_DIR + '/run.sh':
                     assert member.mode == 0o755
-        for name, digest in json.loads((extracted / 'MANIFEST.sha256.json').read_text(encoding='utf-8')).items():
-            assert hashlib.sha256((extracted / name).read_bytes()).hexdigest() == digest, name
-        assert b'\r' not in (extracted / 'run.sh').read_bytes()
+        app_root = extracted / PACKAGE_DIR
+        assert (app_root / 'main3.py').is_file()
+        assert not (extracted / 'main3.py').exists()
+        for name, digest in json.loads((app_root / 'MANIFEST.sha256.json').read_text(encoding='utf-8')).items():
+            assert hashlib.sha256((app_root / name).read_bytes()).hexdigest() == digest, name
+        assert b'\r' not in (app_root / 'run.sh').read_bytes()
         sample = (ROOT.parents[1] / 'docs' / 'request.txt').read_text(encoding='utf-8-sig')
         # The checked-in illustrative sample contains a trailing comma.
         payload = json.loads(re.sub(r',(\s*[}\]])', r'\1', sample))
@@ -65,7 +70,7 @@ def verify(destination):
             sock.bind(('127.0.0.1', 0))
             port = sock.getsockname()[1]
         with (extracted / 'server.log').open('wb') as log:
-            process = subprocess.Popen([sys.executable, '-I', '-B', str(extracted / 'main3.py'), str(port)],
+            process = subprocess.Popen([sys.executable, '-I', '-B', str(app_root / 'main3.py'), str(port)],
                                        cwd=folder, stdout=log, stderr=log,
                                        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             try:
@@ -100,7 +105,7 @@ def verify(destination):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', type=Path, default=ROOT / 'dist' / 'CoreGeekV2.tar.gz')
+    parser.add_argument('--output', type=Path, default=ROOT / 'dist' / 'CoreGeek.tar.gz')
     parser.add_argument('--verify', action='store_true')
     args = parser.parse_args()
     digest = build(args.output)
