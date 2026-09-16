@@ -1,5 +1,16 @@
 # 《未来战争》Agent 对战平台（agent-game）
 
+## CoreGeek V2 Demo
+
+新增独立的 [CoreGeek V2](Demo/CoreGeekV2/README.md)，以 `780e98e` 策略为基线完善昼夜流程、施工与移动冲突、资源预留和平台任务反馈。运行 `python -B Demo/CoreGeekV2/main3.py <port>`；Python 3.11+、仅标准库，无需连接真实 LLM。
+
+- [可上传的 tar.gz](Demo/CoreGeekV2/dist/CoreGeekV2.tar.gz) · [SHA-256](Demo/CoreGeekV2/dist/CoreGeekV2.tar.gz.sha256)
+- [运行与打包说明](Demo/CoreGeekV2/README.md) · [架构](Demo/CoreGeekV2/ARCHITECTURE.md) · [验证记录](Demo/CoreGeekV2/VALIDATION.md)
+
+原有 CoreGeek 和平台代码保留。以下为原平台说明。
+
+---
+
 云核心网编程大赛《未来战争》v1.0 的本地开发与对战平台：一套**忠实复刻比赛规则的模拟判题器**、**两个可对战的 agent**（我方智能 agent + 固定策略基线对手）、以及**逐回合可视化回放前端**。全部代码以《接口文档》（`docs/接口文档.md`）与 demo 报文（`docs/request.txt` / `docs/response.txt`）为唯一协议权威实现。
 
 本项目使用 [OpenSpec](https://github.com/Fission-AI/OpenSpec) 进行规格驱动开发：`openspec/` 目录保存了本次变更的完整规划文档（proposal / specs / design / tasks），实现过程严格按规格推进，48/48 任务完成。
