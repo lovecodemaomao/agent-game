@@ -46,12 +46,12 @@ bash Demo/CoreGeekV2/run.sh 8081
 python -B Demo/CoreGeekV2/package_demo.py --verify
 ```
 
-输出 `Demo/CoreGeekV2/dist/CoreGeekV2.tar.gz` 和同名 `.sha256`。压缩包根目录为 `run.sh`、`main3.py` 和 `src/`；包含官方规则副本、架构说明和哈希清单，不包含缓存、Git 历史或模拟器依赖。
+输出 `Demo/CoreGeekV2/dist/CoreGeek.tar.gz` 和同名 `.sha256`。压缩包必须保留顶层 `CoreGeek/` 目录，里面是 `run.sh`、`main3.py` 和 `src/`，对应平台 `/home/docker/CoreGeek/main3.py`；包含官方规则副本、架构说明和哈希清单，不包含缓存、Git 历史或模拟器依赖。
 
 ```bash
 mkdir coregeek-v2
-tar -xzf CoreGeekV2.tar.gz -C coregeek-v2
-cd coregeek-v2
+tar -xzf CoreGeek.tar.gz -C coregeek-v2
+cd coregeek-v2/CoreGeek
 bash run.sh 8081
 ```
 

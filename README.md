@@ -4,7 +4,7 @@
 
 新增独立的 [CoreGeek V2](Demo/CoreGeekV2/README.md)，以 `780e98e` 策略为基线完善昼夜流程、施工与移动冲突、资源预留和平台任务反馈。运行 `python -B Demo/CoreGeekV2/main3.py <port>`；Python 3.11+、仅标准库，无需连接真实 LLM。
 
-- [可上传的 tar.gz](Demo/CoreGeekV2/dist/CoreGeekV2.tar.gz) · [SHA-256](Demo/CoreGeekV2/dist/CoreGeekV2.tar.gz.sha256)
+- [可上传的 tar.gz](Demo/CoreGeekV2/dist/CoreGeek.tar.gz) · [SHA-256](Demo/CoreGeekV2/dist/CoreGeek.tar.gz.sha256)
 - [运行与打包说明](Demo/CoreGeekV2/README.md) · [架构](Demo/CoreGeekV2/ARCHITECTURE.md) · [验证记录](Demo/CoreGeekV2/VALIDATION.md)
 
 原有 CoreGeek 和平台代码保留。以下为原平台说明。
